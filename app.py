@@ -51,7 +51,7 @@ def load_submitted_forms():
         return []
     try:
         forms_ref = db.collection('forms')
-        docs = forms_ref.order_by('timestamp', direction=firestore.DESCENDING).stream()
+        docs = forms_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).stream()
         return [doc.to_dict() for doc in docs]
     except Exception as e:
         st.error(f"Error loading forms: {e}")
