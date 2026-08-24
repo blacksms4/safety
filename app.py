@@ -52,7 +52,24 @@ def load_submitted_forms():
     try:
         forms_ref = db.collection('forms')
         docs = forms_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).stream()
-        return [doc.to_dict() for doc in docs]
+        forms = []
+        for doc in docs:
+            form_data = doc.to_dict()
+            # Decode signatures from JSON strings back to lists
+            if 'signatures' in form_data:
+                signatures_decoded = {}
+                for k, v in form_data['signatures'].items():
+                    if isinstance(v, str):
+                        try:
+                            import json
+                            signatures_decoded[k] = json.loads(v)
+                        except:
+                            signatures_decoded[k] = v
+                    else:
+                        signatures_decoded[k] = v
+                form_data['signatures'] = signatures_decoded
+            forms.append(form_data)
+        return forms
     except Exception as e:
         st.error(f"Error loading forms: {e}")
         return []
@@ -61,9 +78,22 @@ def save_form(form_data):
     if db is None:
         return False
     try:
-        # Convert numpy arrays to lists for JSON serialization
+        # Convert numpy arrays to base64 strings for Firestore compatibility
         if 'signatures' in form_data:
-            form_data['signatures'] = {k: v.tolist() if hasattr(v, 'tolist') else v for k, v in form_data['signatures'].items()}
+            signatures_encoded = {}
+            for k, v in form_data['signatures'].items():
+                if hasattr(v, 'tolist'):
+                    # Convert numpy array to list, then to JSON string
+                    import json
+                    v_list = v.tolist()
+                    signatures_encoded[k] = json.dumps(v_list)
+                elif isinstance(v, list):
+                    # Convert list to JSON string
+                    import json
+                    signatures_encoded[k] = json.dumps(v)
+                else:
+                    signatures_encoded[k] = v
+            form_data['signatures'] = signatures_encoded
         form_data['timestamp'] = datetime.now()
         db.collection('forms').add(form_data)
         return True
