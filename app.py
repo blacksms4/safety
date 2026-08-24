@@ -11,7 +11,7 @@ from openpyxl.drawing.image import Image as OpenpyxlImage
 from PIL import Image as PILImage
 import io
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage
 
 # Page configuration
 st.set_page_config(
@@ -40,11 +40,15 @@ try:
     }
     if not firebase_admin._apps:
         cred = credentials.Certificate(firebase_creds)
-        firebase_admin.initialize_app(cred)
+        firebase_admin.initialize_app(cred, {
+            'storageBucket': st.secrets.firebase.project_id + '.appspot.com'
+        })
     db = firestore.client(database_id='default')
+    bucket = storage.bucket()
 except Exception as e:
     st.error(f"Firebase initialization error: {e}")
     db = None
+    bucket = None
 
 def load_submitted_forms():
     if db is None:
@@ -71,21 +75,21 @@ def load_submitted_forms():
             if safety_checks:
                 form_data['safety_checks'] = safety_checks
             
-            # Decode signatures from base64 strings
-            if 'signatures' in form_data:
-                import base64
-                import json
-                signatures_decoded = {}
-                for k, v in form_data['signatures'].items():
-                    if isinstance(v, str):
-                        try:
-                            json_str = base64.b64decode(v.encode()).decode()
-                            signatures_decoded[k] = json.loads(json_str)
-                        except:
-                            signatures_decoded[k] = v
-                    else:
-                        signatures_decoded[k] = v
-                form_data['signatures'] = signatures_decoded
+            # Download signatures from Firebase Storage
+            if 'signature_urls' in form_data and bucket is not None:
+                signatures = {}
+                for sig_key, blob_name in form_data['signature_urls'].items():
+                    try:
+                        blob = bucket.blob(blob_name)
+                        img_bytes = blob.download_as_bytes()
+                        img = PILImage.open(io.BytesIO(img_bytes))
+                        import numpy as np
+                        sig_array = np.array(img)
+                        signatures[sig_key] = sig_array
+                    except Exception as e:
+                        print(f"Error downloading signature {sig_key}: {e}")
+                if signatures:
+                    form_data['signatures'] = signatures
             
             forms.append(form_data)
         return forms
@@ -100,7 +104,7 @@ def save_form(form_data):
         # Flatten nested data to avoid Firestore nested entity errors
         form_data_to_save = {}
         
-        # Copy simple fields
+        # Copy simple fields (exclude signatures for now)
         for k, v in form_data.items():
             if k not in ['signatures', 'safety_checks']:
                 form_data_to_save[k] = v
@@ -112,22 +116,35 @@ def save_form(form_data):
                     for check_name, check_value in checks.items():
                         form_data_to_save[f"{category}_{check_name}"] = check_value
         
-        # Store signatures as base64 strings
-        if 'signatures' in form_data:
-            import base64
-            import json
-            signatures_encoded = {}
-            for k, v in form_data['signatures'].items():
-                if hasattr(v, 'tolist'):
-                    v_list = v.tolist()
-                    json_str = json.dumps(v_list)
-                    signatures_encoded[k] = base64.b64encode(json_str.encode()).decode()
-                elif isinstance(v, list):
-                    json_str = json.dumps(v)
-                    signatures_encoded[k] = base64.b64encode(json_str.encode()).decode()
-                else:
-                    signatures_encoded[k] = v
-            form_data_to_save['signatures'] = signatures_encoded
+        # Upload signatures to Firebase Storage
+        signature_urls = {}
+        if 'signatures' in form_data and bucket is not None:
+            for sig_key, sig_data in form_data['signatures'].items():
+                if sig_data is not None and hasattr(sig_data, 'tolist'):
+                    try:
+                        # Convert numpy array to image
+                        import numpy as np
+                        img_array = np.array(sig_data)
+                        img = PILImage.fromarray(img_array.astype('uint8'))
+                        
+                        # Convert to bytes
+                        img_bytes = io.BytesIO()
+                        img.save(img_bytes, format='PNG')
+                        img_bytes.seek(0)
+                        
+                        # Upload to Firebase Storage
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        blob_name = f"signatures/{timestamp}_{sig_key}.png"
+                        blob = bucket.blob(blob_name)
+                        blob.upload_from_file(img_bytes, content_type='image/png')
+                        
+                        # Get download URL
+                        signature_urls[sig_key] = blob_name
+                    except Exception as e:
+                        print(f"Error uploading signature {sig_key}: {e}")
+        
+        if signature_urls:
+            form_data_to_save['signature_urls'] = signature_urls
         
         # Add metadata
         form_data_to_save['timestamp'] = datetime.now()
