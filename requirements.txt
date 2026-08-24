@@ -1,0 +1,5 @@
+streamlit
+openpyxl
+Pillow
+numpy
+firebase-admin
