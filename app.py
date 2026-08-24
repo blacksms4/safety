@@ -40,11 +40,10 @@ try:
     }
     if not firebase_admin._apps:
         cred = credentials.Certificate(firebase_creds)
-        firebase_admin.initialize_app(cred, {
-            'storageBucket': st.secrets.firebase.project_id + '.appspot.com'
-        })
+        firebase_admin.initialize_app(cred)
     db = firestore.client(database_id='default')
-    bucket = storage.bucket()
+    bucket_name = st.secrets.firebase.project_id + '.appspot.com'
+    bucket = storage.bucket(bucket_name)
 except Exception as e:
     st.error(f"Firebase initialization error: {e}")
     db = None
