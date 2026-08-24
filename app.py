@@ -41,7 +41,7 @@ try:
     if not firebase_admin._apps:
         cred = credentials.Certificate(firebase_creds)
         firebase_admin.initialize_app(cred)
-    db = firestore.client()
+    db = firestore.client(database_id='default')
 except Exception as e:
     st.error(f"Firebase initialization error: {e}")
     db = None
