@@ -2,4 +2,6 @@ streamlit
 openpyxl
 Pillow
 numpy
+streamlit-drawable-canvas
 firebase-admin
+pandas
