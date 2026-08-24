@@ -27,16 +27,16 @@ EXCEL_TEMPLATE = "안전작업허가서.xlsx"
 # Initialize Firebase
 try:
     firebase_creds = {
-        "type": st.secrets.STREAMLIT_FIREBASE_TYPE,
-        "project_id": st.secrets.STREAMLIT_FIREBASE_PROJECT_ID,
-        "private_key_id": st.secrets.STREAMLIT_FIREBASE_PRIVATE_KEY_ID,
-        "private_key": st.secrets.STREAMLIT_FIREBASE_PRIVATE_KEY,
-        "client_email": st.secrets.STREAMLIT_FIREBASE_CLIENT_EMAIL,
-        "client_id": st.secrets.STREAMLIT_FIREBASE_CLIENT_ID,
-        "auth_uri": st.secrets.STREAMLIT_FIREBASE_AUTH_URI,
-        "token_uri": st.secrets.STREAMLIT_FIREBASE_TOKEN_URI,
-        "auth_provider_x509_cert_url": st.secrets.STREAMLIT_FIREBASE_AUTH_PROVIDER_X509_CERT_URL,
-        "client_x509_cert_url": st.secrets.STREAMLIT_FIREBASE_CLIENT_X509_CERT_URL,
+        "type": st.secrets.firebase.type,
+        "project_id": st.secrets.firebase.project_id,
+        "private_key_id": st.secrets.firebase.private_key_id,
+        "private_key": st.secrets.firebase.private_key,
+        "client_email": st.secrets.firebase.client_email,
+        "client_id": st.secrets.firebase.client_id,
+        "auth_uri": st.secrets.firebase.auth_uri,
+        "token_uri": st.secrets.firebase.token_uri,
+        "auth_provider_x509_cert_url": st.secrets.firebase.auth_provider_x509_cert_url,
+        "client_x509_cert_url": st.secrets.firebase.client_x509_cert_url,
     }
     if not firebase_admin._apps:
         cred = credentials.Certificate(firebase_creds)
