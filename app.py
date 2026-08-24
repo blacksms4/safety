@@ -71,6 +71,22 @@ def load_submitted_forms():
             if safety_checks:
                 form_data['safety_checks'] = safety_checks
             
+            # Decode signatures from base64 strings
+            if 'signatures' in form_data:
+                import base64
+                import json
+                signatures_decoded = {}
+                for k, v in form_data['signatures'].items():
+                    if isinstance(v, str):
+                        try:
+                            json_str = base64.b64decode(v.encode()).decode()
+                            signatures_decoded[k] = json.loads(json_str)
+                        except:
+                            signatures_decoded[k] = v
+                    else:
+                        signatures_decoded[k] = v
+                form_data['signatures'] = signatures_decoded
+            
             forms.append(form_data)
         return forms
     except Exception as e:
@@ -96,9 +112,25 @@ def save_form(form_data):
                     for check_name, check_value in checks.items():
                         form_data_to_save[f"{category}_{check_name}"] = check_value
         
+        # Store signatures as base64 strings
+        if 'signatures' in form_data:
+            import base64
+            import json
+            signatures_encoded = {}
+            for k, v in form_data['signatures'].items():
+                if hasattr(v, 'tolist'):
+                    v_list = v.tolist()
+                    json_str = json.dumps(v_list)
+                    signatures_encoded[k] = base64.b64encode(json_str.encode()).decode()
+                elif isinstance(v, list):
+                    json_str = json.dumps(v)
+                    signatures_encoded[k] = base64.b64encode(json_str.encode()).decode()
+                else:
+                    signatures_encoded[k] = v
+            form_data_to_save['signatures'] = signatures_encoded
+        
         # Add metadata
         form_data_to_save['timestamp'] = datetime.now()
-        form_data_to_save['has_signatures'] = 'signatures' in form_data and bool(form_data['signatures'])
         
         db.collection('forms').add(form_data_to_save)
         return True
