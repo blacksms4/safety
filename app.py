@@ -85,14 +85,12 @@ def load_submitted_forms():
                         import numpy as np
                         sig_array = np.array(img)
                         signatures[sig_key] = sig_array
-                        print(f"Successfully downloaded signature {sig_key} from {blob_name}")
                     except Exception as e:
-                        print(f"Error downloading signature {sig_key}: {e}")
+                        st.error(f"Error downloading signature {sig_key}: {e}")
                 if signatures:
                     form_data['signatures'] = signatures
-                    print(f"Loaded {len(signatures)} signatures for form")
                 else:
-                    print("No signatures loaded")
+                    st.warning("No signatures loaded from Firebase Storage")
             
             forms.append(form_data)
         return forms
@@ -122,7 +120,6 @@ def save_form(form_data):
         # Upload signatures to Firebase Storage
         signature_urls = {}
         if 'signatures' in form_data and bucket is not None:
-            print(f"Found signatures in form_data: {list(form_data['signatures'].keys())}")
             for sig_key, sig_data in form_data['signatures'].items():
                 if sig_data is not None and hasattr(sig_data, 'tolist'):
                     try:
@@ -144,11 +141,10 @@ def save_form(form_data):
                         
                         # Get download URL
                         signature_urls[sig_key] = blob_name
-                        print(f"Successfully uploaded signature {sig_key} to {blob_name}")
                     except Exception as e:
-                        print(f"Error uploading signature {sig_key}: {e}")
+                        st.error(f"Error uploading signature {sig_key}: {e}")
                 else:
-                    print(f"Signature {sig_key} data is None or not a numpy array")
+                    st.warning(f"Signature {sig_key} data is None or not a numpy array")
         
         if signature_urls:
             form_data_to_save['signature_urls'] = signature_urls
@@ -267,11 +263,6 @@ def fill_excel_template(form_data):
     
     safety_data = form_data.get('safety_checks', {})
     text_field_data = form_data.get('safety_text_fields', {})
-    
-    print(f"fill_excel_template called with form_data keys: {form_data.keys()}")
-    print(f"signatures in form_data: {'signatures' in form_data}")
-    if 'signatures' in form_data:
-        print(f"signatures keys: {form_data['signatures'].keys()}")
     
     cell_mapping = {
         # 허가번호 = 공사명 + 순번(예: 공사명01) - top-left of I3:AD3 merged range
