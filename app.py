@@ -55,19 +55,22 @@ def load_submitted_forms():
         forms = []
         for doc in docs:
             form_data = doc.to_dict()
-            # Decode signatures from JSON strings back to lists
-            if 'signatures' in form_data:
-                signatures_decoded = {}
-                for k, v in form_data['signatures'].items():
-                    if isinstance(v, str):
-                        try:
-                            import json
-                            signatures_decoded[k] = json.loads(v)
-                        except:
-                            signatures_decoded[k] = v
-                    else:
-                        signatures_decoded[k] = v
-                form_data['signatures'] = signatures_decoded
+            
+            # Reconstruct safety_checks from flattened format
+            safety_checks = {}
+            for k, v in form_data.items():
+                if '_' in k and k not in ['work_location', 'work_description']:
+                    # Check if this is a flattened safety check
+                    parts = k.split('_', 1)
+                    if len(parts) == 2:
+                        category, check_name = parts
+                        if category not in safety_checks:
+                            safety_checks[category] = {}
+                        safety_checks[category][check_name] = v
+            
+            if safety_checks:
+                form_data['safety_checks'] = safety_checks
+            
             forms.append(form_data)
         return forms
     except Exception as e:
@@ -78,24 +81,26 @@ def save_form(form_data):
     if db is None:
         return False
     try:
-        # Convert numpy arrays to base64 strings for Firestore compatibility
-        if 'signatures' in form_data:
-            signatures_encoded = {}
-            for k, v in form_data['signatures'].items():
-                if hasattr(v, 'tolist'):
-                    # Convert numpy array to list, then to JSON string
-                    import json
-                    v_list = v.tolist()
-                    signatures_encoded[k] = json.dumps(v_list)
-                elif isinstance(v, list):
-                    # Convert list to JSON string
-                    import json
-                    signatures_encoded[k] = json.dumps(v)
-                else:
-                    signatures_encoded[k] = v
-            form_data['signatures'] = signatures_encoded
-        form_data['timestamp'] = datetime.now()
-        db.collection('forms').add(form_data)
+        # Flatten nested data to avoid Firestore nested entity errors
+        form_data_to_save = {}
+        
+        # Copy simple fields
+        for k, v in form_data.items():
+            if k not in ['signatures', 'safety_checks']:
+                form_data_to_save[k] = v
+        
+        # Flatten safety_checks
+        if 'safety_checks' in form_data:
+            for category, checks in form_data['safety_checks'].items():
+                if isinstance(checks, dict):
+                    for check_name, check_value in checks.items():
+                        form_data_to_save[f"{category}_{check_name}"] = check_value
+        
+        # Add metadata
+        form_data_to_save['timestamp'] = datetime.now()
+        form_data_to_save['has_signatures'] = 'signatures' in form_data and bool(form_data['signatures'])
+        
+        db.collection('forms').add(form_data_to_save)
         return True
     except Exception as e:
         st.error(f"Error saving form: {e}")
