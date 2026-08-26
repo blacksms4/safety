@@ -422,6 +422,16 @@ RISK_ASSESSMENT_CELLS = {
     'risk_assessment_diff': {'유': 'AV11', '무': 'AZ11'},
 }
 
+# 작업종류 선택 시 해당 작업 구역의 대표 체크박스에 표시한다.
+# "용접작업"과 "기타"는 현재 Excel 템플릿에 별도 대표 체크칸이 없다.
+WORK_TYPE_CHECKBOX_CELL_MAP = {
+    '밀폐작업': 'E19',
+    '전기작업': 'E24',
+    '굴착작업': 'E29',
+    '고소작업': 'E31',
+    '중장비작업': 'E33',
+}
+
 
 def fill_excel_template(form_data):
     if not os.path.exists(EXCEL_TEMPLATE):
@@ -436,7 +446,9 @@ def fill_excel_template(form_data):
     
     safety_data = form_data.get('safety_checks', {})
     text_field_data = form_data.get('safety_text_fields', {})
-    completion_time_value = format_time_value(form_data.get('completion_time'))
+    completion_time_value = format_time_value(
+        form_data.get('permit_end_time') or form_data.get('completion_time')
+    )
     worker_count_value = format_worker_count(form_data.get('worker_count'))
     
     cell_mapping = {
@@ -454,7 +466,7 @@ def fill_excel_template(form_data):
         'AL6': form_data.get('work_target', ''),
         'I8': form_data.get('work_description', ''),  # 작업 개요 (top-left of I8:BD9 merged range)
         'I36': form_data.get('special_notes', ''),  # 기타 특별사항 (top-left of I36:BD36 merged range)
-        'L40': completion_time_value,  # 작업완료 시간 (top-left of L40:S40 merged range)
+        'L40': completion_time_value,  # 작업완료 시간: 작업허가기간의 종료시간 (top-left of L40:S40 merged range)
         'AI40': worker_count_value,  # 작업자 명수 (top-left of AI40:AO40 merged range)
     }
     
@@ -486,6 +498,22 @@ def fill_excel_template(form_data):
             cell_mapping['AH5'] = _h  # 시까지 (시)
         except ValueError:
             pass
+
+    # 화면에서 선택한 작업종류에 맞춰 Excel의 해당 작업 대표 체크칸을 표시한다.
+    selected_work_types = form_data.get('work_types') or []
+    if isinstance(selected_work_types, str):
+        selected_work_types = [item.strip() for item in selected_work_types.split(',') if item.strip()]
+    if not selected_work_types:
+        work_type_text = form_data.get('work_type', '')
+        selected_work_types = [
+            work_type_name
+            for work_type_name in WORK_TYPE_CHECKBOX_CELL_MAP
+            if work_type_name in work_type_text
+        ]
+    for work_type_name in selected_work_types:
+        target_cell = WORK_TYPE_CHECKBOX_CELL_MAP.get(work_type_name)
+        if target_cell:
+            cell_mapping[target_cell] = '☑'
     
     # 체크된 항목만 표시(☑). 체크 안 된 항목은 서식 원본의 '□'를 그대로 둔다.
     for (category, item), cell in CHECKBOX_CELL_MAP.items():
@@ -537,17 +565,20 @@ def fill_excel_template(form_data):
         cell_mapping['T37'] = f'{worker_name_for_sig}          (서명)'
 
     # 담당자(관리자, 관리자 페이지에서 지정) - 입회자 / 발급자(담당자) / 각 작업별 확인자란에 이름을 넣는다.
-    # 서명 이미지는 없고 이름 텍스트만 "(서명)" 문구와 함께 넣는다.
+    # 입회자는 이름만, 발급자/확인자는 서식에 맞춰 "(서명)" 문구를 함께 넣는다.
     manager_name = form_data.get('manager_name', '')
     if manager_name:
+        manager_attendee_text = manager_name
         manager_sig_text = f'{manager_name}     (서명)'
-        cell_mapping['AI37'] = manager_sig_text  # 입회자 (top-left of AI37:AV37)
+        confined_space_sig_text = f'{manager_name} (서명)'
+        cell_mapping['AI37'] = manager_sig_text  # 37행 입회자 (top-left of AI37:AV37)
         cell_mapping['W38'] = manager_sig_text  # 발급자(담당자) (top-left of W38:AD38)
+        cell_mapping['X40'] = manager_attendee_text  # 작업완료 40행 입회자 (top-left of X40:AD40)
         cell_mapping['AW41'] = manager_sig_text  # 오른쪽 맨아래 발급자(담당자) 서명칸 (AW41:BD41)
 
         # 밀폐공간/정전/굴착/고소/중장비가 해당되면 각 확인자란에도 담당자 이름을 넣는다.
         if safety_data.get('밀폐공간', {}).get('해당', False):
-            cell_mapping['AX19'] = manager_sig_text  # 밀폐공간 확인자
+            cell_mapping['AX19'] = confined_space_sig_text  # 밀폐공간 확인자
         if safety_data.get('정전', {}).get('해당', False):
             cell_mapping['AT26'] = manager_sig_text  # 정전(현장) 확인자
             cell_mapping['AT28'] = manager_sig_text  # 정전(전원복구) 확인자
@@ -977,6 +1008,7 @@ if page == "👷 현장 작업자":
         st.checkbox("잠금장치 시건, 표지부착", key="check_정전_잠금장치 시건, 표지부착")
         st.markdown("**정전 허가기간**")
         st.info(f"{work_date} (작업일자와 동일)")
+        st.info("전원복구 참고: 모든 작업이 완료 된 후 운전부서의 입회자의 요청에 의해서만 전원을 복구하여야 한다.")
         st.text_input("전원복구 요청자", key="text_정전_전원복구 요청자")
         st.text_input("전원복구 시간", key="text_정전_전원복구 시간")
 
