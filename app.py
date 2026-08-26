@@ -4,14 +4,13 @@ from datetime import datetime
 from streamlit_drawable_canvas import st_canvas
 import base64
 from io import BytesIO
-import json
 import os
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from PIL import Image as PILImage
 import io
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import credentials, firestore
 
 # Page configuration
 st.set_page_config(
@@ -26,28 +25,139 @@ EXCEL_TEMPLATE = "안전작업허가서.xlsx"
 
 # Initialize Firebase
 try:
-    firebase_creds = {
-        "type": st.secrets.firebase.type,
-        "project_id": st.secrets.firebase.project_id,
-        "private_key_id": st.secrets.firebase.private_key_id,
-        "private_key": st.secrets.firebase.private_key,
-        "client_email": st.secrets.firebase.client_email,
-        "client_id": st.secrets.firebase.client_id,
-        "auth_uri": st.secrets.firebase.auth_uri,
-        "token_uri": st.secrets.firebase.token_uri,
-        "auth_provider_x509_cert_url": st.secrets.firebase.auth_provider_x509_cert_url,
-        "client_x509_cert_url": st.secrets.firebase.client_x509_cert_url,
-    }
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(firebase_creds)
-        firebase_admin.initialize_app(cred)
-    db = firestore.client(database_id='default')
-    bucket_name = st.secrets.firebase.project_id + '.appspot.com'
-    bucket = storage.bucket(bucket_name)
+    # Try to load from JSON file first (for local development)
+    json_key_path = "home-assistant-7430-firebase-adminsdk-9qngt-c2f6659ad5.json"
+    if os.path.exists(json_key_path):
+        cred = credentials.Certificate(json_key_path)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        db = firestore.client(database_id='default')
+    else:
+        # Fallback to secrets.toml (for deployment)
+        firebase_creds = {
+            "type": st.secrets.firebase.type,
+            "project_id": st.secrets.firebase.project_id,
+            "private_key_id": st.secrets.firebase.private_key_id,
+            "private_key": st.secrets.firebase.private_key.replace('\\n', '\n'),
+            "client_email": st.secrets.firebase.client_email,
+            "client_id": st.secrets.firebase.client_id,
+            "auth_uri": st.secrets.firebase.auth_uri,
+            "token_uri": st.secrets.firebase.token_uri,
+            "auth_provider_x509_cert_url": st.secrets.firebase.auth_provider_x509_cert_url,
+            "client_x509_cert_url": st.secrets.firebase.client_x509_cert_url,
+        }
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(firebase_creds)
+            firebase_admin.initialize_app(cred)
+        db = firestore.client(database_id='default')
 except Exception as e:
     st.error(f"Firebase initialization error: {e}")
     db = None
-    bucket = None
+
+SAFETY_CHECK_CATEGORY_NAMES = {
+    '첨부서류',
+    '안전조치 요구사항',
+    '밀폐공간',
+    '정전',
+    '굴착',
+    '고소',
+    '중장비',
+}
+
+
+def normalize_clock_time(value):
+    """사용자가 입력한 시각을 HH:MM 형식으로 정규화한다."""
+    value = str(value or "").strip()
+    if not value:
+        return "", None
+
+    if value.isdigit():
+        if len(value) <= 2:
+            hour, minute = int(value), 0
+        elif len(value) == 3:
+            hour, minute = int(value[0]), int(value[1:])
+        elif len(value) == 4:
+            hour, minute = int(value[:2]), int(value[2:])
+        else:
+            return value, "숫자는 최대 4자리로 입력해 주세요."
+    else:
+        parts = value.split(":")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            return value, "숫자 또는 HH:MM 형식으로 입력해 주세요."
+        hour, minute = map(int, parts)
+
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return value, "올바른 시간 범위(00:00~23:59)로 입력해 주세요."
+
+    return f"{hour:02d}:{minute:02d}", None
+
+
+def normalize_time_widget(key):
+    """시간 입력이 끝나면 해당 위젯 값을 HH:MM 형식으로 바꾼다."""
+    normalized, error = normalize_clock_time(st.session_state.get(key, ""))
+    if error:
+        st.session_state[f"{key}_error"] = error
+        return
+
+    st.session_state[key] = normalized
+    st.session_state.pop(f"{key}_error", None)
+
+
+def format_time_value(value):
+    """datetime/time/string 값을 Excel에 쓰기 좋은 HH:MM 문자열로 맞춘다."""
+    if not value:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+
+    value = str(value).strip()
+    if len(value) >= 5 and value[2] == ":":
+        return value[:5]
+    return value
+
+
+def format_worker_count(value):
+    """작업자 명수를 Excel 작업자 칸에 표시할 문자열로 변환한다."""
+    if value in (None, ""):
+        return ""
+
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return str(value).strip()
+
+    if count <= 0:
+        return ""
+    return f"{count}명"
+
+
+def decode_form_signatures(form_data):
+    """Excel 생성에 필요한 제출 건의 서명만 지연 디코딩한다."""
+    encoded_signatures = form_data.get('signatures')
+    if not isinstance(encoded_signatures, dict):
+        return form_data
+
+    decoded_signatures = {}
+    for sig_key, sig_value in encoded_signatures.items():
+        if not isinstance(sig_value, str):
+            decoded_signatures[sig_key] = sig_value
+            continue
+
+        try:
+            import numpy as np
+
+            if sig_value.startswith('data:image/png;base64,'):
+                sig_value = sig_value.split(',', 1)[1]
+            img_bytes = base64.b64decode(sig_value)
+            img = PILImage.open(io.BytesIO(img_bytes))
+            decoded_signatures[sig_key] = np.array(img)
+        except Exception as e:
+            st.error(f"Error decoding signature {sig_key}: {e}")
+
+    decoded_form = dict(form_data)
+    decoded_form['signatures'] = decoded_signatures
+    return decoded_form
+
 
 def load_submitted_forms():
     if db is None:
@@ -58,39 +168,23 @@ def load_submitted_forms():
         forms = []
         for doc in docs:
             form_data = doc.to_dict()
+            # 관리자 수정 시 조건 검색을 거치지 않고 해당 문서를 바로 갱신한다.
+            form_data['_doc_id'] = doc.id
             
             # Reconstruct safety_checks from flattened format
             safety_checks = {}
             for k, v in form_data.items():
-                if '_' in k and k not in ['work_location', 'work_description']:
-                    # Check if this is a flattened safety check
-                    parts = k.split('_', 1)
-                    if len(parts) == 2:
-                        category, check_name = parts
-                        if category not in safety_checks:
-                            safety_checks[category] = {}
-                        safety_checks[category][check_name] = v
+                # 저장 시 평탄화한 실제 안전점검 항목만 다시 묶는다.
+                # gas_measurements 같은 일반 필드의 밑줄은 안전점검 항목으로 오인하지 않는다.
+                for category in SAFETY_CHECK_CATEGORY_NAMES:
+                    prefix = f"{category}_"
+                    if k.startswith(prefix):
+                        check_name = k[len(prefix):]
+                        safety_checks.setdefault(category, {})[check_name] = v
+                        break
             
             if safety_checks:
                 form_data['safety_checks'] = safety_checks
-            
-            # Download signatures from Firebase Storage
-            if 'signature_urls' in form_data and bucket is not None:
-                signatures = {}
-                for sig_key, blob_name in form_data['signature_urls'].items():
-                    try:
-                        blob = bucket.blob(blob_name)
-                        img_bytes = blob.download_as_bytes()
-                        img = PILImage.open(io.BytesIO(img_bytes))
-                        import numpy as np
-                        sig_array = np.array(img)
-                        signatures[sig_key] = sig_array
-                    except Exception as e:
-                        st.error(f"Error downloading signature {sig_key}: {e}")
-                if signatures:
-                    form_data['signatures'] = signatures
-                else:
-                    st.warning("No signatures loaded from Firebase Storage")
             
             forms.append(form_data)
         return forms
@@ -117,14 +211,15 @@ def save_form(form_data):
                     for check_name, check_value in checks.items():
                         form_data_to_save[f"{category}_{check_name}"] = check_value
         
-        # Upload signatures to Firebase Storage
-        signature_urls = {}
-        if 'signatures' in form_data and bucket is not None:
+        # Convert signatures to base64 strings
+        if 'signatures' in form_data:
+            signature_base64 = {}
             for sig_key, sig_data in form_data['signatures'].items():
                 if sig_data is not None and hasattr(sig_data, 'tolist'):
                     try:
-                        # Convert numpy array to image
+                        import base64
                         import numpy as np
+                        # Convert numpy array to image
                         img_array = np.array(sig_data)
                         img = PILImage.fromarray(img_array.astype('uint8'))
                         
@@ -133,21 +228,16 @@ def save_form(form_data):
                         img.save(img_bytes, format='PNG')
                         img_bytes.seek(0)
                         
-                        # Upload to Firebase Storage
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        blob_name = f"signatures/{timestamp}_{sig_key}.png"
-                        blob = bucket.blob(blob_name)
-                        blob.upload_from_file(img_bytes, content_type='image/png')
-                        
-                        # Get download URL
-                        signature_urls[sig_key] = blob_name
+                        # Convert to base64
+                        img_base64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
+                        signature_base64[sig_key] = f"data:image/png;base64,{img_base64}"
                     except Exception as e:
-                        st.error(f"Error uploading signature {sig_key}: {e}")
+                        st.error(f"Error encoding signature {sig_key}: {e}")
                 else:
                     st.warning(f"Signature {sig_key} data is None or not a numpy array")
-        
-        if signature_urls:
-            form_data_to_save['signature_urls'] = signature_urls
+            
+            if signature_base64:
+                form_data_to_save['signatures'] = signature_base64
         
         # Add metadata
         form_data_to_save['timestamp'] = datetime.now()
@@ -169,6 +259,57 @@ def delete_form(form_id):
         return True
     except Exception as e:
         st.error(f"Error deleting form: {e}")
+        return False
+
+
+def delete_all_forms():
+    """관리자 페이지의 전체 삭제용: Firestore forms 컬렉션 문서를 모두 삭제한다."""
+    if db is None:
+        return None
+    try:
+        docs = list(db.collection('forms').stream())
+        deleted_count = 0
+        batch = db.batch()
+
+        for index, doc in enumerate(docs, start=1):
+            batch.delete(doc.reference)
+            deleted_count += 1
+            if index % 450 == 0:
+                batch.commit()
+                batch = db.batch()
+
+        if deleted_count % 450:
+            batch.commit()
+
+        return deleted_count
+    except Exception as e:
+        st.error(f"Error deleting all forms: {e}")
+        return None
+
+
+def update_manager_name(form_id, manager_name, doc_id=None):
+    """관리자 페이지에서 제출된 건에 담당자(관리자)를 지정/변경한다."""
+    return update_form_fields(form_id, {'manager_name': manager_name}, doc_id=doc_id)
+
+def update_form_fields(form_id, updates, doc_id=None):
+    """관리자 페이지에서 제출된 건의 특정 필드(들)를 지정/변경한다."""
+    if db is None:
+        return False
+    try:
+        if doc_id:
+            db.collection('forms').document(doc_id).update(updates)
+            return True
+
+        # 이전 데이터처럼 문서 ID가 없는 경우에만 기존 검색 방식을 사용한다.
+        forms_ref = db.collection('forms')
+        docs = forms_ref.where('id', '==', form_id).stream()
+        updated = False
+        for doc in docs:
+            doc.reference.update(updates)
+            updated = True
+        return updated
+    except Exception as e:
+        st.error(f"Error updating form: {e}")
         return False
 
 # 실제 "안전작업허가서.xlsx" 병합 셀 구조를 스캔해서 확인한 정확한 좌표.
@@ -235,6 +376,34 @@ TEXT_FIELD_CELL_MAP = {
     '정전 허가기간': 'AT25',
 }
 
+# 밀폐공간 가스농도 측정값 4건: Excel 서식의 22~23행 좌/우 입력 묶음에 대응한다.
+GAS_MEASUREMENT_CELL_MAP = [
+    {
+        'material_name': 'E22',
+        'result': 'M22',
+        'measurement_time': 'Q22',
+        'measurer_confirmer': 'W22',
+    },
+    {
+        'material_name': 'AE22',
+        'result': 'AM22',
+        'measurement_time': 'AQ22',
+        'measurer_confirmer': 'AW22',
+    },
+    {
+        'material_name': 'E23',
+        'result': 'M23',
+        'measurement_time': 'Q23',
+        'measurer_confirmer': 'W23',
+    },
+    {
+        'material_name': 'AE23',
+        'result': 'AM23',
+        'measurement_time': 'AQ23',
+        'measurer_confirmer': 'AW23',
+    },
+]
+
 # 밀폐공간/정전 카테고리 전체("해당사항") 체크박스
 CATEGORY_CHECKBOX_CELL_MAP = {
     '밀폐공간': 'E19',
@@ -257,12 +426,18 @@ RISK_ASSESSMENT_CELLS = {
 def fill_excel_template(form_data):
     if not os.path.exists(EXCEL_TEMPLATE):
         return None
+
+    # 관리자 목록을 표시할 때는 무거운 서명 변환을 하지 않고,
+    # 실제로 이 제출 건을 다운로드할 때만 변환한다.
+    form_data = decode_form_signatures(form_data)
     
     wb = load_workbook(EXCEL_TEMPLATE)
     ws = wb.active
     
     safety_data = form_data.get('safety_checks', {})
     text_field_data = form_data.get('safety_text_fields', {})
+    completion_time_value = format_time_value(form_data.get('completion_time'))
+    worker_count_value = format_worker_count(form_data.get('worker_count'))
     
     cell_mapping = {
         # 허가번호 = 공사명 + 순번(예: 공사명01) - top-left of I3:AD3 merged range
@@ -271,11 +446,16 @@ def fill_excel_template(form_data):
         'L4': form_data.get('company_name', ''),
         # 신청인 직책 - top-left of Z4:AD4 merged range
         'Z4': form_data.get('worker_position', ''),
+        # 신청인 성명(실제 서식엔 AL4:BD4가 "성명+(서명)" 입력칸이고, AE4:AK4는 "성명"이라는 고정 라벨임.
+        # AE4에 값을 쓰면 라벨을 지워버리는 문제가 있어 AL4 한 곳에서만 "성명 + (서명)"으로 처리함(아래).
         # 작업위치(작업장소) - top-left of R6:AD7 merged range (I6는 "작업위치" 라벨이라 쓰면 안 됨)
         'R6': form_data.get('work_location', ''),
+        # 작업대상 - top-left of AL6:BD7 merged range (AE6:AK7은 "작업대상" 고정 라벨)
+        'AL6': form_data.get('work_target', ''),
         'I8': form_data.get('work_description', ''),  # 작업 개요 (top-left of I8:BD9 merged range)
         'I36': form_data.get('special_notes', ''),  # 기타 특별사항 (top-left of I36:BD36 merged range)
-        'L40': form_data.get('completion_time', ''),  # 작업완료 시간 (top-left of L40:S40 merged range)
+        'L40': completion_time_value,  # 작업완료 시간 (top-left of L40:S40 merged range)
+        'AI40': worker_count_value,  # 작업자 명수 (top-left of AI40:AO40 merged range)
     }
     
     # 작업허가기간 = 항상 작업일자 기준 (년/월/일), 시작~종료 시간 별도 입력
@@ -287,6 +467,9 @@ def fill_excel_template(form_data):
             cell_mapping['I5'] = str(_d.year)
             cell_mapping['P5'] = str(_d.month)
             cell_mapping['U5'] = str(_d.day)
+            # 허가일자(AE3 라벨 옆 AL3:BD3 입력칸)는 작업허가기간과 별개 칸이라 따로 채워야 함.
+            # 앱에 별도 "허가일자" 입력이 없어 우선 작업일자와 동일하게 자동 기입함.
+            cell_mapping['AL3'] = f'{_d.year}년 {_d.month}월 {_d.day}일'
         except ValueError:
             pass
     # 템플릿은 Z5:AB5(시부터 앞)와 AH5:AJ5(시까지 앞)에 시간을 기입한다.
@@ -334,14 +517,53 @@ def fill_excel_template(form_data):
         value = text_field_data.get(field_name, '')
         if value:
             cell_mapping[cell] = value
+
+    # 밀폐공간 가스농도 측정 4건을 서식의 22~23행 좌/우 표에 매핑한다.
+    for measurement, target_cells in zip(
+        form_data.get('gas_measurements', []), GAS_MEASUREMENT_CELL_MAP
+    ):
+        if not isinstance(measurement, dict):
+            continue
+        for field_name, cell in target_cells.items():
+            value = measurement.get(field_name, '')
+            if value:
+                cell_mapping[cell] = value
     
-    # 신청인 성명(AL4), 시행업체 책임자 서명(T37)란에 책임자 성명 텍스트를 넣는다.
-    # (서명 이미지는 아래 signatures 처리 블록에서 같은 두 칸에 겹쳐서 삽입됨)
-    company_rep_name = form_data.get('company_rep_name', '')
-    if company_rep_name:
-        cell_mapping['AL4'] = f'{company_rep_name}          (서명)'
-        cell_mapping['T37'] = f'{company_rep_name}          (서명)'
-    
+    # 신청인란(AL4)과 시행업체 책임자란(T37)에 동일하게 "성명 + (서명)"을 넣는다(같은 사람, 같은 이름).
+    # 서명은 책임자 서명 1개만 받으므로, 이미지는 아래 signatures 처리 블록에서 이 두 칸에 동일하게 겹쳐서 삽입됨.
+    worker_name_for_sig = form_data.get('worker_name', '')
+    if worker_name_for_sig:
+        cell_mapping['AL4'] = f'{worker_name_for_sig}          (서명)'
+        cell_mapping['T37'] = f'{worker_name_for_sig}          (서명)'
+
+    # 담당자(관리자, 관리자 페이지에서 지정) - 입회자 / 발급자(담당자) / 각 작업별 확인자란에 이름을 넣는다.
+    # 서명 이미지는 없고 이름 텍스트만 "(서명)" 문구와 함께 넣는다.
+    manager_name = form_data.get('manager_name', '')
+    if manager_name:
+        manager_sig_text = f'{manager_name}     (서명)'
+        cell_mapping['AI37'] = manager_sig_text  # 입회자 (top-left of AI37:AV37)
+        cell_mapping['W38'] = manager_sig_text  # 발급자(담당자) (top-left of W38:AD38)
+        cell_mapping['AW41'] = manager_sig_text  # 오른쪽 맨아래 발급자(담당자) 서명칸 (AW41:BD41)
+
+        # 밀폐공간/정전/굴착/고소/중장비가 해당되면 각 확인자란에도 담당자 이름을 넣는다.
+        if safety_data.get('밀폐공간', {}).get('해당', False):
+            cell_mapping['AX19'] = manager_sig_text  # 밀폐공간 확인자
+        if safety_data.get('정전', {}).get('해당', False):
+            cell_mapping['AT26'] = manager_sig_text  # 정전(현장) 확인자
+            cell_mapping['AT28'] = manager_sig_text  # 정전(전원복구) 확인자
+        if '굴착' in safety_data:
+            cell_mapping['AT30'] = manager_sig_text  # 굴착 확인자
+        if '고소' in safety_data:
+            cell_mapping['AT32'] = manager_sig_text  # 고소 확인자
+        if '중장비' in safety_data:
+            cell_mapping['AT35'] = manager_sig_text  # 중장비 확인자
+
+    # 승인자(팀장, 관리자 페이지에서 지정) - 서명 이미지 없이 이름 텍스트만 넣는다.
+    approver_name = form_data.get('approver_name', '')
+    if approver_name:
+        cell_mapping['W39'] = f'{approver_name}     (서명)'  # 승인자(팀장) 성명 (top-left of W39:AD39)
+
+
     # Write field values
     for cell, value in cell_mapping.items():
         # Skip if value is empty
@@ -529,18 +751,25 @@ if page == "👷 현장 작업자":
         st.markdown('<span class="basic-info-marker"></span>', unsafe_allow_html=True)
         st.markdown("#### 작업 정보")
         work_date = st.date_input("작업일자", datetime.now(), key="work_date")
-        permit_start_time = st.time_input(
-            "작업 시작 시간", value=None, key="permit_start_time",
-            help="시간을 직접 입력하거나 시계에서 선택할 수 있습니다.",
+        permit_start_time = st.text_input(
+            "작업 시작 시간", key="permit_start_time_text", placeholder="예: 8 또는 0830",
+            help="숫자만 입력하면 자동으로 HH:MM 형식으로 바뀝니다. 예: 8 → 08:00, 1730 → 17:30",
+            max_chars=5, on_change=normalize_time_widget, args=("permit_start_time_text",),
         )
-        permit_end_time = st.time_input(
-            "작업 종료 시간", value=None, key="permit_end_time",
-            help="시간을 직접 입력하거나 시계에서 선택할 수 있습니다.",
+        if st.session_state.get("permit_start_time_text_error"):
+            st.error(f"작업 시작 시간: {st.session_state['permit_start_time_text_error']}")
+        permit_end_time = st.text_input(
+            "작업 종료 시간", key="permit_end_time_text", placeholder="예: 17 또는 1730",
+            help="숫자만 입력하면 자동으로 HH:MM 형식으로 바뀝니다. 예: 17 → 17:00, 1730 → 17:30",
+            max_chars=5, on_change=normalize_time_widget, args=("permit_end_time_text",),
         )
+        if st.session_state.get("permit_end_time_text_error"):
+            st.error(f"작업 종료 시간: {st.session_state['permit_end_time_text_error']}")
         work_location = st.text_input("작업장소", key="work_location")
+        work_target = st.text_input("작업대상", key="work_target")
         work_types = st.multiselect(
             "작업종류 (복수 선택 가능)",
-            ["굴착작업", "고소작업", "중장비작업", "전기작업", "용접작업", "화학작업", "기타"],
+            ["굴착작업", "고소작업", "중장비작업", "전기작업", "용접작업", "밀폐작업", "기타"],
             key="work_types",
             help="선택한 모든 작업 종류의 점검 항목이 아래에 표시됩니다.",
         )
@@ -558,6 +787,15 @@ if page == "👷 현장 작업자":
         company_name = st.text_input("업체명", key="company_name")
         worker_position = st.text_input("직책", key="worker_position")
         worker_name = st.text_input("성명", key="worker_name")
+        worker_count = st.number_input(
+            "작업자(명)",
+            min_value=0,
+            step=1,
+            value=0,
+            key="worker_count",
+            help="작업 인원을 숫자로 입력하세요.",
+        )
+        # 담당자(관리자)는 현장 작업자가 아니라 관리자 페이지에서 제출 건별로 지정한다.
 
     # Section 2: 작업 내용
     st.markdown('<div class="section-header">📝 작업 내용</div>', unsafe_allow_html=True)
@@ -640,6 +878,7 @@ if page == "👷 현장 작업자":
         "중장비작업": ["중장비"],
     }
     visible_safety_categories = ["첨부서류", "안전조치 요구사항"]
+    required_safety_checks = {("안전조치 요구사항", "안전장구"), ("안전조치 요구사항", "안전교육")}
     for selected_work_type in work_types:
         for category in work_type_categories.get(selected_work_type, []):
             if category not in visible_safety_categories:
@@ -648,23 +887,22 @@ if page == "👷 현장 작업자":
     def render_safety_category(category, checks, fields, column_count=2):
         """카테고리별 체크/입력 항목을 넓은 화면에서는 여러 열로 표시한다."""
         st.markdown(f'<div class="category-title">{category}</div>', unsafe_allow_html=True)
+        if category == "안전조치 요구사항":
+            st.info("필수 확인: 안전장구와 안전교육을 모두 체크해야 제출할 수 있습니다.")
 
         checkbox_columns = st.columns(min(column_count, len(checks)))
         for index, check in enumerate(checks):
             with checkbox_columns[index % len(checkbox_columns)]:
-                st.checkbox(check, key=f"check_{category}_{check}")
+                label = f"{check} (필수)" if (category, check) in required_safety_checks else check
+                st.checkbox(label, key=f"check_{category}_{check}")
 
         if fields:
             text_columns = st.columns(min(2, len(fields)))
             for index, field in enumerate(fields):
                 with text_columns[index % len(text_columns)]:
                     if "허가기간" in field:
-                        st.time_input(
-                            field,
-                            value=None,
-                            key=f"text_{category}_{field}",
-                            help="시간을 직접 입력하거나 시계에서 선택할 수 있습니다.",
-                        )
+                        st.markdown(f"**{field}**")
+                        st.info(f"{work_date} (작업일자와 동일)")
                     else:
                         st.text_input(field, key=f"text_{category}_{field}")
 
@@ -684,18 +922,47 @@ if page == "👷 현장 작업자":
     risk_assessment_change = st.radio("작업절차서변화", ["선택 안 함", "유", "무"], key="risk_assessment_change", horizontal=True)
     risk_assessment_diff = st.radio("작업상이", ["선택 안 함", "유", "무"], key="risk_assessment_diff", horizontal=True)
 
-    # 밀폐공간은 화학작업 선택 시에만 표시한다.
-    is_confined_space_work = "화학작업" in work_types
+    # 밀폐공간은 밀폐작업 선택 시에만 표시한다.
+    is_confined_space_work = "밀폐작업" in work_types
     if is_confined_space_work:
         st.markdown('<div class="checkbox-group"><strong>밀폐공간</strong></div>', unsafe_allow_html=True)
         confined_space_applies = st.checkbox("밀폐공간 작업 해당", key="check_밀폐공간_해당")
         st.checkbox("통신수단", key="check_밀폐공간_통신수단")
         st.checkbox("구명장구(줄, 송기마스크)", key="check_밀폐공간_구명장구(줄, 송기마스크)")
-        st.time_input(
-            "허가기간", value=None, key="text_밀폐공간_밀폐공간 허가기간",
-            help="시간을 직접 입력하거나 시계에서 선택할 수 있습니다.",
-        )
+        st.markdown("**밀폐공간 허가기간**")
+        st.info(f"{work_date} (작업일자와 동일)")
         st.caption("참고자료: 가스농도 측정결과 1. HC: 0%, 2. O2: 18%이상, 3. CO: 30ppm미만, 4. CO2: 1.5%미만, 5. H2S: 10ppm미만")
+
+        if confined_space_applies:
+            st.markdown("#### 🧪 가스농도 측정")
+            st.caption("Excel 서식의 22~23행 좌·우 가스농도 측정란에 각각 입력됩니다.")
+            for measurement_index in range(1, 5):
+                st.markdown(f"**측정 {measurement_index}**")
+                gas_col1, gas_col2, gas_col3, gas_col4 = st.columns([2, 1.5, 1.5, 2])
+                with gas_col1:
+                    st.text_input(
+                        "물질명",
+                        key=f"gas_{measurement_index}_material_name",
+                        placeholder="예: O2, CO, H2S",
+                    )
+                with gas_col2:
+                    st.text_input(
+                        "결과",
+                        key=f"gas_{measurement_index}_result",
+                        placeholder="예: 20.9%, 0ppm",
+                    )
+                with gas_col3:
+                    st.time_input(
+                        "측정시간",
+                        value=None,
+                        key=f"gas_{measurement_index}_measurement_time",
+                    )
+                with gas_col4:
+                    st.text_input(
+                        "측정자/확인자",
+                        key=f"gas_{measurement_index}_measurer_confirmer",
+                        placeholder="성명 입력",
+                    )
 
     # 정전 항목은 전기작업 선택 시에만 표시한다.
     is_power_outage_work = "전기작업" in work_types
@@ -708,10 +975,8 @@ if page == "👷 현장 작업자":
         )
         st.checkbox("스위치/차단기 내림", key="check_정전_스위치/차단기 내림")
         st.checkbox("잠금장치 시건, 표지부착", key="check_정전_잠금장치 시건, 표지부착")
-        st.time_input(
-            "허가기간", value=None, key="text_정전_정전 허가기간",
-            help="시간을 직접 입력하거나 시계에서 선택할 수 있습니다.",
-        )
+        st.markdown("**정전 허가기간**")
+        st.info(f"{work_date} (작업일자와 동일)")
         st.text_input("전원복구 요청자", key="text_정전_전원복구 요청자")
         st.text_input("전원복구 시간", key="text_정전_전원복구 시간")
 
@@ -742,24 +1007,10 @@ if page == "👷 현장 작업자":
 
     # Signature section
     # 발급자/승인자/입회자/작업자 서명은 관리자가 나중에 처리하므로 현장 작업자 화면에서는 받지 않음
-    # 책임자 서명 하나만 받고, 신청인란·시행업체(책임자)란 둘 다 이 서명으로 채움
+    # 책임자 서명 하나만 받고, 신청인란·시행업체(책임자)란 둘 다 이 서명 + 위에서 입력한 성명으로 채움
     signature_canvas("company_rep", "책임자 서명")
-    company_rep_name = st.text_input("책임자 성명", key="company_rep_name")
 
-    # Section 5: 작업 완료
-    st.markdown('<div class="section-header">🏁 작업 완료 확인</div>', unsafe_allow_html=True)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        completion_time = st.time_input(
-            "작업 완료 시간", value=None, key="completion_time",
-            help="시간을 직접 입력하거나 시계에서 선택할 수 있습니다.",
-        )
-    with col2:
-        restoration_status = st.selectbox("복원(조치)상태", ["완료", "부분완료", "미완료"], key="restoration_status")
-        restoration_notes = st.text_input("복원 상세 내용", key="restoration_notes")
-
-    # Section 6: 작업 허가 연장
+    # Section 5: 작업 허가 연장
     st.markdown('<div class="section-header">⏰ 작업 허가 연장</div>', unsafe_allow_html=True)
 
     extend_requested = st.radio(
@@ -780,15 +1031,40 @@ if page == "👷 현장 작업자":
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        if st.button("� 제출하기", use_container_width=True, type="primary"):
+        if st.button("📤 제출하기", use_container_width=True, type="primary"):
+            normalized_start, start_error = normalize_clock_time(permit_start_time)
+            normalized_end, end_error = normalize_clock_time(permit_end_time)
+            missing_required_checks = [
+                check
+                for category, check in required_safety_checks
+                if not st.session_state.get(f"check_{category}_{check}", False)
+            ]
+
+            validation_errors = []
+            if start_error:
+                validation_errors.append(f"작업 시작 시간: {start_error}")
+            if end_error:
+                validation_errors.append(f"작업 종료 시간: {end_error}")
+            if missing_required_checks:
+                validation_errors.append(
+                    "안전조치 요구사항의 필수 항목을 체크해 주세요: "
+                    + ", ".join(sorted(missing_required_checks))
+                )
+
+            if validation_errors:
+                for error in validation_errors:
+                    st.error(error)
+                st.stop()
+
             # Collect form data
             form_data = {
                 'id': datetime.now().strftime("%Y%m%d%H%M%S"),
                 'submitted_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'work_date': str(work_date),
-                'permit_start_time': str(permit_start_time) if permit_start_time else None,
-                'permit_end_time': str(permit_end_time) if permit_end_time else None,
+                'permit_start_time': normalized_start or None,
+                'permit_end_time': normalized_end or None,
                 'work_location': work_location,
+                'work_target': work_target,
                 'work_type': work_type,
                 'work_types': work_types,
                 'construction_name': construction_name,
@@ -796,21 +1072,20 @@ if page == "👷 현장 작업자":
                 'company_name': company_name,
                 'worker_position': worker_position,
                 'worker_name': worker_name,
+                'worker_count': int(worker_count) if worker_count else None,
+                'manager_name': None,  # 담당자(관리자)는 관리자 페이지에서 나중에 지정
                 'work_description': work_description,
                 'special_notes': special_notes,
-                'company_rep_name': company_rep_name,
                 'power_outage_location': None if power_outage_location == "선택 안 함" else power_outage_location,
                 'risk_assessment_change': None if risk_assessment_change == "선택 안 함" else risk_assessment_change,
                 'risk_assessment_diff': None if risk_assessment_diff == "선택 안 함" else risk_assessment_diff,
-                'completion_time': str(completion_time) if completion_time else None,
-                'restoration_status': restoration_status,
-                'restoration_notes': restoration_notes,
                 'extend_requested': extend_requested == "연장 신청",
                 'extend_date': str(extend_date) if extend_date else None,
                 'extend_start': str(extend_start) if extend_start else None,
                 'extend_end': str(extend_end) if extend_end else None,
                 'safety_checks': {},
                 'safety_text_fields': {},
+                'gas_measurements': [],
                 'signatures': st.session_state.signatures
             }
             
@@ -825,21 +1100,41 @@ if page == "👷 현장 작업자":
             for category in visible_safety_categories:
                 fields = safety_text_fields.get(category, [])
                 for field in fields:
-                    value = st.session_state.get(f"text_{category}_{field}", "")
-                    if value:
-                        form_data['safety_text_fields'][field] = str(value)
+                    if "허가기간" in field:
+                        form_data['safety_text_fields'][field] = str(work_date)
+                    else:
+                        value = st.session_state.get(f"text_{category}_{field}", "")
+                        if value:
+                            form_data['safety_text_fields'][field] = str(value)
             
-            # 밀폐공간 (화학작업일 때만 저장)
+            # 밀폐공간 (밀폐작업일 때만 저장)
             if is_confined_space_work:
                 form_data['safety_checks']['밀폐공간'] = {
                     '해당': st.session_state.get("check_밀폐공간_해당", False),
                     '통신수단': st.session_state.get("check_밀폐공간_통신수단", False),
                     '구명장구(줄, 송기마스크)': st.session_state.get("check_밀폐공간_구명장구(줄, 송기마스크)", False),
                 }
-                if st.session_state.get("text_밀폐공간_밀폐공간 허가기간", ""):
-                    form_data['safety_text_fields']['밀폐공간 허가기간'] = str(
-                        st.session_state.get("text_밀폐공간_밀폐공간 허가기간", "")
-                    )
+                form_data['safety_text_fields']['밀폐공간 허가기간'] = str(work_date)
+
+                if confined_space_applies:
+                    for measurement_index in range(1, 5):
+                        measurement_time = st.session_state.get(
+                            f"gas_{measurement_index}_measurement_time"
+                        )
+                        form_data['gas_measurements'].append({
+                            'material_name': st.session_state.get(
+                                f"gas_{measurement_index}_material_name", ""
+                            ).strip(),
+                            'result': st.session_state.get(
+                                f"gas_{measurement_index}_result", ""
+                            ).strip(),
+                            'measurement_time': (
+                                measurement_time.strftime('%H:%M') if measurement_time else ""
+                            ),
+                            'measurer_confirmer': st.session_state.get(
+                                f"gas_{measurement_index}_measurer_confirmer", ""
+                            ).strip(),
+                        })
             
             # 정전 (전기작업일 때만 저장)
             if is_power_outage_work:
@@ -848,15 +1143,16 @@ if page == "👷 현장 작업자":
                     '스위치/차단기 내림': st.session_state.get("check_정전_스위치/차단기 내림", False),
                     '잠금장치 시건, 표지부착': st.session_state.get("check_정전_잠금장치 시건, 표지부착", False),
                 }
-                for field in ["정전 허가기간", "전원복구 요청자", "전원복구 시간"]:
+                form_data['safety_text_fields']['정전 허가기간'] = str(work_date)
+                for field in ["전원복구 요청자", "전원복구 시간"]:
                     value = st.session_state.get(f"text_정전_{field}", "")
                     if value:
                         form_data['safety_text_fields'][field] = str(value)
             
             # Save form
-            save_form(form_data)
-            st.success("✅ 안전작업허가서가 제출되었습니다!")
-            st.balloons()
+            if save_form(form_data):
+                st.success("✅ 안전작업허가서가 제출되었습니다!")
+                st.balloons()
 
     with col2:
         if st.button("🔄 초기화", use_container_width=True):
@@ -871,16 +1167,18 @@ if page == "👷 현장 작업자":
     st.markdown('<div class="section-header">📊 입력 내용 요약</div>', unsafe_allow_html=True)
 
     summary_data = {
-        "항목": ["작업일자", "작업 시작~종료", "작업장소", "공사명(허가번호)", "작업종류", "업체명", "성명", "직책"],
+        "항목": ["작업일자", "작업 시작~종료", "작업장소", "작업대상", "공사명(허가번호)", "작업종류", "업체명", "성명", "직책", "작업자(명)"],
         "내용": [
             work_date,
             f"{permit_start_time or '-'} ~ {permit_end_time or '-'}",
             work_location,
+            work_target,
             permit_number,
             work_type,
             company_name,
             worker_name,
-            worker_position
+            worker_position,
+            worker_count if worker_count else ""
         ]
     }
 
@@ -914,16 +1212,17 @@ if page == "👷 현장 작업자":
     for category in visible_safety_categories:
         fields = safety_text_fields.get(category, [])
         for field in fields:
-            value = st.session_state.get(f"text_{category}_{field}", "")
-            if value:
-                filled_text_fields.append(f"{field}: {value}")
+            if "허가기간" in field:
+                filled_text_fields.append(f"{field}: {work_date}")
+            else:
+                value = st.session_state.get(f"text_{category}_{field}", "")
+                if value:
+                    filled_text_fields.append(f"{field}: {value}")
     if is_confined_space_work:
-        for field in ["밀폐공간 허가기간"]:
-            value = st.session_state.get(f"text_밀폐공간_{field}", "")
-            if value:
-                filled_text_fields.append(f"{field}: {value}")
+        filled_text_fields.append(f"밀폐공간 허가기간: {work_date}")
     if is_power_outage_work:
-        for field in ["정전 허가기간", "전원복구 요청자", "전원복구 시간"]:
+        filled_text_fields.append(f"정전 허가기간: {work_date}")
+        for field in ["전원복구 요청자", "전원복구 시간"]:
             value = st.session_state.get(f"text_정전_{field}", "")
             if value:
                 filled_text_fields.append(f"{field}: {value}")
@@ -934,6 +1233,26 @@ if page == "👷 현장 작업자":
         st.markdown("### 📝 입력된 텍스트 항목")
         for item in filled_text_fields:
             st.markdown(f"- {item}")
+
+    if is_confined_space_work and confined_space_applies:
+        gas_measurement_summary = []
+        for measurement_index in range(1, 5):
+            measurement_time = st.session_state.get(f"gas_{measurement_index}_measurement_time")
+            measurement = {
+                "구분": f"측정 {measurement_index}",
+                "물질명": st.session_state.get(f"gas_{measurement_index}_material_name", ""),
+                "결과": st.session_state.get(f"gas_{measurement_index}_result", ""),
+                "측정시간": measurement_time.strftime('%H:%M') if measurement_time else "",
+                "측정자/확인자": st.session_state.get(
+                    f"gas_{measurement_index}_measurer_confirmer", ""
+                ),
+            }
+            if any(measurement[field] for field in ["물질명", "결과", "측정시간", "측정자/확인자"]):
+                gas_measurement_summary.append(measurement)
+
+        if gas_measurement_summary:
+            st.markdown("### 🧪 가스농도 측정 입력 내용")
+            st.table(pd.DataFrame(gas_measurement_summary))
 
 else:
     # Admin page
@@ -957,17 +1276,66 @@ else:
                     st.markdown(f"**작업일자:** {form['work_date']}")
                     st.markdown(f"**작업 시작~종료:** {form.get('permit_start_time','')} ~ {form.get('permit_end_time','')}")
                     st.markdown(f"**작업장소:** {form['work_location']}")
+                    if form.get('work_target'):
+                        st.markdown(f"**작업대상:** {form['work_target']}")
                     st.markdown(f"**허가번호(공사명):** {form.get('permit_number','')}")
                     st.markdown(f"**작업종류:** {form['work_type']}")
                     st.markdown(f"**업체명:** {form.get('company_name','')}")
                     st.markdown(f"**성명:** {form['worker_name']}")
                     st.markdown(f"**직책:** {form.get('worker_position','')}")
+                    if form.get('worker_count'):
+                        st.markdown(f"**작업자(명):** {form.get('worker_count')}")
                 
                 with col2:
-                    st.markdown(f"**책임자:** {form.get('company_rep_name', '')}")
                     if form.get('power_outage_location'):
                         st.markdown(f"**정전 차단 위치:** {form['power_outage_location']}")
-                
+
+                # 담당자(관리자) 지정 - 현장 제출 화면이 아니라 여기서 관리자가 직접 이름을 입력/저장
+                st.markdown("**담당자(관리자) 지정:**")
+                current_manager = form.get('manager_name') or ""
+                col_m1, col_m2 = st.columns([3, 1])
+                with col_m1:
+                    manager_input = st.text_input(
+                        "담당자",
+                        value=current_manager,
+                        key=f"manager_input_{form['id']}",
+                        label_visibility="collapsed",
+                        placeholder="담당자 이름 입력",
+                    )
+                with col_m2:
+                    if st.button("저장", key=f"manager_save_{form['id']}", use_container_width=True):
+                        value_to_save = manager_input.strip() or None
+                        with st.spinner("담당자 저장 중..."):
+                            manager_saved = update_manager_name(
+                                form['id'], value_to_save, doc_id=form.get('_doc_id')
+                            )
+                        if manager_saved:
+                            form['manager_name'] = value_to_save
+                            st.success("담당자가 저장되었습니다.")
+
+                # 승인자(팀장) 지정 - Excel 결과물 생성 시점에 관리자가 직접 이름을 입력/저장
+                st.markdown("**승인자(팀장) 지정:**")
+                current_approver = form.get('approver_name') or ""
+                col_a1, col_a2 = st.columns([3, 1])
+                with col_a1:
+                    approver_input = st.text_input(
+                        "승인자(팀장)",
+                        value=current_approver,
+                        key=f"approver_input_{form['id']}",
+                        label_visibility="collapsed",
+                        placeholder="승인자(팀장) 이름 입력",
+                    )
+                with col_a2:
+                    if st.button("저장", key=f"approver_save_{form['id']}", use_container_width=True):
+                        value_to_save = approver_input.strip() or None
+                        with st.spinner("승인자 저장 중..."):
+                            approver_saved = update_form_fields(
+                                form['id'], {'approver_name': value_to_save}, doc_id=form.get('_doc_id')
+                            )
+                        if approver_saved:
+                            form['approver_name'] = value_to_save
+                            st.success("승인자(팀장)가 저장되었습니다.")
+
                 st.markdown("**작업 내용:**")
                 st.text(form['work_description'])
                 
@@ -982,6 +1350,24 @@ else:
                     st.markdown("**텍스트 입력 항목:**")
                     for field, value in text_fields.items():
                         st.markdown(f"- {field}: {value}")
+
+                gas_measurements = [
+                    (index, measurement)
+                    for index, measurement in enumerate(form.get('gas_measurements', []), start=1)
+                    if isinstance(measurement, dict) and any(measurement.values())
+                ]
+                if gas_measurements:
+                    st.markdown("**가스농도 측정:**")
+                    st.table(pd.DataFrame([
+                        {
+                            "구분": f"측정 {index}",
+                            "물질명": measurement.get('material_name', ''),
+                            "결과": measurement.get('result', ''),
+                            "측정시간": measurement.get('measurement_time', ''),
+                            "측정자/확인자": measurement.get('measurer_confirmer', ''),
+                        }
+                        for index, measurement in gas_measurements
+                    ]))
                 
                 if form['special_notes']:
                     st.markdown(f"**특별사항:** {form['special_notes']}")
@@ -1018,10 +1404,23 @@ else:
         
         with col1:
             if st.button("🗑️ 전체 삭제", use_container_width=True):
-                if st.confirm("정말 모든 양식을 삭제하시겠습니까?"):
-                    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-                        json.dump([], f)
-                    st.rerun()
+                st.session_state.confirm_delete_all_forms = True
+
+            if st.session_state.get('confirm_delete_all_forms'):
+                st.warning("정말 모든 양식을 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.")
+                confirm_col, cancel_col = st.columns(2)
+                with confirm_col:
+                    if st.button("삭제 확정", key="confirm_delete_all_forms_button", use_container_width=True, type="primary"):
+                        with st.spinner("전체 양식 삭제 중..."):
+                            deleted_count = delete_all_forms()
+                        if deleted_count is not None:
+                            st.session_state.confirm_delete_all_forms = False
+                            st.success(f"{deleted_count}건이 삭제되었습니다.")
+                            st.rerun()
+                with cancel_col:
+                    if st.button("취소", key="cancel_delete_all_forms_button", use_container_width=True):
+                        st.session_state.confirm_delete_all_forms = False
+                        st.rerun()
         
         with col2:
             if st.button("📊 통계 보기", use_container_width=True):
