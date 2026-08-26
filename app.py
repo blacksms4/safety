@@ -788,26 +788,6 @@ st.markdown("""
         padding: 0.65rem 0.85rem;
         font-weight: 700;
     }
-    .required-check-card {
-        background: #fff3cd;
-        border: 1px solid #f4c430;
-        border-left: 5px solid #f59e0b;
-        border-radius: 6px;
-        color: #5f4200;
-        font-weight: 700;
-        margin: 0.25rem 0 0.1rem;
-        padding: 0.55rem 0.7rem;
-    }
-    .required-check-card .required-pill {
-        background: #f59e0b;
-        border-radius: 999px;
-        color: #ffffff;
-        display: inline-block;
-        font-size: 0.75rem;
-        margin-left: 0.35rem;
-        padding: 0.08rem 0.45rem;
-        vertical-align: middle;
-    }
     .basic-info-marker {
         display: none;
     }
@@ -1025,12 +1005,8 @@ if page == "👷 현장 작업자":
             with checkbox_columns[index % len(checkbox_columns)]:
                 is_required = (category, check) in required_safety_checks
                 if is_required:
-                    st.markdown(
-                        f'<div class="required-check-card">{check}<span class="required-pill">필수</span></div>',
-                        unsafe_allow_html=True,
-                    )
                     st.checkbox(
-                        "확인",
+                        f":orange[{check}] (필수)",
                         key=f"check_{category}_{check}",
                         help=f"{check} 필수 항목입니다.",
                     )
