@@ -131,6 +131,58 @@ def format_worker_count(value):
     return f"{count}명"
 
 
+def get_admin_password():
+    """관리자 비밀번호를 Streamlit secrets 또는 환경변수에서 읽는다."""
+    try:
+        admin_section = st.secrets.get("admin", {})
+        if hasattr(admin_section, "get"):
+            password = admin_section.get("password")
+            if password:
+                return str(password)
+
+        password = st.secrets.get("admin_password")
+        if password:
+            return str(password)
+    except Exception:
+        pass
+
+    password = os.environ.get("ADMIN_PASSWORD")
+    return str(password) if password else ""
+
+
+def require_admin_login():
+    """관리자 페이지 접근 전 간단한 비밀번호 확인을 수행한다."""
+    admin_password = get_admin_password()
+
+    if st.session_state.get("admin_authenticated"):
+        with st.sidebar:
+            if st.button("관리자 로그아웃"):
+                st.session_state.admin_authenticated = False
+                st.rerun()
+        return True
+
+    st.title("👨‍💼 관리자 로그인")
+    st.markdown("---")
+
+    if not admin_password:
+        st.warning("관리자 비밀번호가 아직 설정되어 있지 않습니다.")
+        st.info('Streamlit Secrets에 `[admin] password = "원하는비밀번호"`를 추가하거나, 환경변수 `ADMIN_PASSWORD`를 설정해 주세요.')
+        return False
+
+    with st.form("admin_login_form"):
+        password_input = st.text_input("관리자 비밀번호", type="password")
+        submitted = st.form_submit_button("관리자 페이지 들어가기")
+
+    if submitted:
+        if password_input == admin_password:
+            st.session_state.admin_authenticated = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 올바르지 않습니다.")
+
+    return False
+
+
 def decode_form_signatures(form_data):
     """Excel 생성에 필요한 제출 건의 서명만 지연 디코딩한다."""
     encoded_signatures = form_data.get('signatures')
@@ -736,6 +788,26 @@ st.markdown("""
         padding: 0.65rem 0.85rem;
         font-weight: 700;
     }
+    .required-check-card {
+        background: #fff3cd;
+        border: 1px solid #f4c430;
+        border-left: 5px solid #f59e0b;
+        border-radius: 6px;
+        color: #5f4200;
+        font-weight: 700;
+        margin: 0.25rem 0 0.1rem;
+        padding: 0.55rem 0.7rem;
+    }
+    .required-check-card .required-pill {
+        background: #f59e0b;
+        border-radius: 999px;
+        color: #ffffff;
+        display: inline-block;
+        font-size: 0.75rem;
+        margin-left: 0.35rem;
+        padding: 0.08rem 0.45rem;
+        vertical-align: middle;
+    }
     .basic-info-marker {
         display: none;
     }
@@ -951,8 +1023,19 @@ if page == "👷 현장 작업자":
         checkbox_columns = st.columns(min(column_count, len(checks)))
         for index, check in enumerate(checks):
             with checkbox_columns[index % len(checkbox_columns)]:
-                label = f"{check} (필수)" if (category, check) in required_safety_checks else check
-                st.checkbox(label, key=f"check_{category}_{check}")
+                is_required = (category, check) in required_safety_checks
+                if is_required:
+                    st.markdown(
+                        f'<div class="required-check-card">{check}<span class="required-pill">필수</span></div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.checkbox(
+                        "확인",
+                        key=f"check_{category}_{check}",
+                        help=f"{check} 필수 항목입니다.",
+                    )
+                else:
+                    st.checkbox(check, key=f"check_{category}_{check}")
 
         if fields:
             text_columns = st.columns(min(2, len(fields)))
@@ -1288,6 +1371,9 @@ if page == "👷 현장 작업자":
 
 else:
     # Admin page
+    if not require_admin_login():
+        st.stop()
+
     st.title("👨‍💼 관리자 페이지")
     st.markdown("---")
     
