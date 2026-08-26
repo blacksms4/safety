@@ -832,7 +832,34 @@ if page == "👷 현장 작업자":
     st.markdown('<div class="section-header">📝 작업 내용</div>', unsafe_allow_html=True)
     work_description = st.text_area("작업 내용 설명", height=100, placeholder="작업의 구체적인 내용을 입력하세요...", key="work_description")
 
-    # Section 3: 안전조치 확인 (Checkboxes)
+    # Section 3: 서명
+    # 모바일에서는 작업종류별 안전조치가 길어지므로, 서명은 조건부 항목보다 먼저 받는다.
+    st.markdown('<div class="section-header">✍️ 서명</div>', unsafe_allow_html=True)
+
+    def signature_canvas(key, label):
+        st.markdown(f"**{label}**")
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 165, 0, 0.3)",
+            stroke_width=3,
+            stroke_color="#000000",
+            background_color="#ffffff",
+            background_image=None,
+            update_streamlit=True,
+            height=150,
+            width=320,
+            drawing_mode="freedraw",
+            point_display_radius=0,
+            key=key,
+        )
+        if canvas_result.image_data is not None:
+            st.session_state.signatures[key] = canvas_result.image_data
+        return canvas_result
+
+    # 발급자/승인자/입회자/작업자 서명은 관리자가 나중에 처리하므로 현장 작업자 화면에서는 받지 않음
+    # 책임자 서명 하나만 받고, 신청인란·시행업체(책임자)란 둘 다 이 서명 + 위에서 입력한 성명으로 채움
+    signature_canvas("company_rep", "책임자 서명")
+
+    # Section 4: 안전조치 확인 (Checkboxes)
     st.markdown('<div class="section-header">✅ 안전조치 확인</div>', unsafe_allow_html=True)
 
     # Safety check categories (matching Excel template's actual checkbox cells)
@@ -1014,33 +1041,6 @@ if page == "👷 현장 작업자":
 
     # Additional safety notes
     special_notes = st.text_input("기타 특별사항", key="special_notes")
-
-    # Section 4: 서명
-    st.markdown('<div class="section-header">✍️ 서명</div>', unsafe_allow_html=True)
-
-    def signature_canvas(key, label):
-        st.markdown(f"**{label}**")
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 165, 0, 0.3)",
-            stroke_width=3,
-            stroke_color="#000000",
-            background_color="#ffffff",
-            background_image=None,
-            update_streamlit=True,
-            height=150,
-            width=400,
-            drawing_mode="freedraw",
-            point_display_radius=0,
-            key=key,
-        )
-        if canvas_result.image_data is not None:
-            st.session_state.signatures[key] = canvas_result.image_data
-        return canvas_result
-
-    # Signature section
-    # 발급자/승인자/입회자/작업자 서명은 관리자가 나중에 처리하므로 현장 작업자 화면에서는 받지 않음
-    # 책임자 서명 하나만 받고, 신청인란·시행업체(책임자)란 둘 다 이 서명 + 위에서 입력한 성명으로 채움
-    signature_canvas("company_rep", "책임자 서명")
 
     # Section 5: 작업 허가 연장
     st.markdown('<div class="section-header">⏰ 작업 허가 연장</div>', unsafe_allow_html=True)
