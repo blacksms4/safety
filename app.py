@@ -901,6 +901,7 @@ if page == "👷 현장 작업자":
             width=320,
             drawing_mode="freedraw",
             point_display_radius=0,
+            return_image_data=True,
             key=key,
         )
         if canvas_result.image_data is not None:
