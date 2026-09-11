@@ -9,8 +9,18 @@ from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from PIL import Image as PILImage
 import io
+import inspect
 import firebase_admin
 from firebase_admin import credentials, firestore
+from app_config import resolve_firebase_credentials_source
+from manager_notifications import (
+    ManagerRepository,
+    NotificationSettingsRepository,
+    attach_manager_notification,
+    form_instance_key,
+    resolve_smtp_config,
+    send_submission_email,
+)
 
 # Page configuration
 st.set_page_config(
@@ -25,34 +35,27 @@ EXCEL_TEMPLATE = "안전작업허가서.xlsx"
 
 # Initialize Firebase
 try:
-    # Try to load from JSON file first (for local development)
     json_key_path = "home-assistant-7430-firebase-adminsdk-9qngt-c2f6659ad5.json"
-    if os.path.exists(json_key_path):
-        cred = credentials.Certificate(json_key_path)
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        db = firestore.client(database_id='default')
-    else:
-        # Fallback to secrets.toml (for deployment)
-        firebase_creds = {
-            "type": st.secrets.firebase.type,
-            "project_id": st.secrets.firebase.project_id,
-            "private_key_id": st.secrets.firebase.private_key_id,
-            "private_key": st.secrets.firebase.private_key.replace('\\n', '\n'),
-            "client_email": st.secrets.firebase.client_email,
-            "client_id": st.secrets.firebase.client_id,
-            "auth_uri": st.secrets.firebase.auth_uri,
-            "token_uri": st.secrets.firebase.token_uri,
-            "auth_provider_x509_cert_url": st.secrets.firebase.auth_provider_x509_cert_url,
-            "client_x509_cert_url": st.secrets.firebase.client_x509_cert_url,
-        }
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(firebase_creds)
-            firebase_admin.initialize_app(cred)
-        db = firestore.client(database_id='default')
+    source_type, firebase_source = resolve_firebase_credentials_source(
+        st.secrets, os.environ, json_key_path
+    )
+    if source_type == "file" and os.environ.get("STREAMLIT_SHARING_MODE"):
+        st.warning(
+            "Firebase 서비스 계정 JSON 파일이 배포 환경에 있습니다. "
+            "Streamlit Secrets로 옮기고 JSON 파일은 GitHub에서 제거하세요."
+        )
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(firebase_source)
+        firebase_admin.initialize_app(cred)
+    db = firestore.client(database_id='default')
 except Exception as e:
     st.error(f"Firebase initialization error: {e}")
     db = None
+
+manager_repository = ManagerRepository(db) if db is not None else None
+notification_settings_repository = (
+    NotificationSettingsRepository(db) if db is not None else None
+)
 
 SAFETY_CHECK_CATEGORY_NAMES = {
     '첨부서류',
@@ -129,6 +132,14 @@ def format_worker_count(value):
     if count <= 0:
         return ""
     return f"{count}명"
+
+
+def resolve_approver_name(form_data):
+    return str(
+        form_data.get("approver_name")
+        or form_data.get("team_leader_name")
+        or ""
+    ).strip()
 
 
 def get_admin_password():
@@ -294,16 +305,20 @@ def save_form(form_data):
         # Add metadata
         form_data_to_save['timestamp'] = datetime.now()
         
-        db.collection('forms').add(form_data_to_save)
-        return True
+        _write_time, document_reference = db.collection('forms').add(form_data_to_save)
+        return document_reference.id
     except Exception as e:
         st.error(f"Error saving form: {e}")
         return False
 
-def delete_form(form_id):
+def delete_form(form_id, doc_id=None):
     if db is None:
         return False
     try:
+        if doc_id:
+            db.collection('forms').document(doc_id).delete()
+            return True
+
         forms_ref = db.collection('forms')
         docs = forms_ref.where('id', '==', form_id).stream()
         for doc in docs:
@@ -337,6 +352,14 @@ def delete_all_forms():
     except Exception as e:
         st.error(f"Error deleting all forms: {e}")
         return None
+
+
+def delete_selected_forms(forms_to_delete):
+    deleted_count = 0
+    for form in forms_to_delete:
+        if delete_form(form['id'], doc_id=form.get('_doc_id')):
+            deleted_count += 1
+    return deleted_count
 
 
 def update_manager_name(form_id, manager_name, doc_id=None):
@@ -642,7 +665,7 @@ def fill_excel_template(form_data):
             cell_mapping['AT35'] = manager_sig_text  # 중장비 확인자
 
     # 승인자(팀장, 관리자 페이지에서 지정) - 서명 이미지 없이 이름 텍스트만 넣는다.
-    approver_name = form_data.get('approver_name', '')
+    approver_name = resolve_approver_name(form_data)
     if approver_name:
         cell_mapping['W39'] = f'{approver_name}     (서명)'  # 승인자(팀장) 성명 (top-left of W39:AD39)
 
@@ -757,6 +780,20 @@ def fill_excel_template(form_data):
     output.seek(0)
     return output
 
+
+def build_excel_email_attachments(form_data):
+    excel_data = fill_excel_template(form_data)
+    if not excel_data:
+        return []
+    content = excel_data.getvalue() if hasattr(excel_data, "getvalue") else excel_data
+    return [
+        {
+            "filename": f"safety_work_permit_{form_data.get('id', 'submission')}.xlsx",
+            "content": content,
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+    ]
+
 # Custom CSS
 st.markdown("""
 <style>
@@ -822,6 +859,15 @@ if page == "👷 현장 작업자":
     st.title("🛡️ 안전작업허가서 - 현장 작업자")
     st.markdown("---")
 
+    available_managers = []
+    auto_email_enabled = False
+    if manager_repository is not None:
+        try:
+            available_managers = manager_repository.list_all()
+            auto_email_enabled = notification_settings_repository.is_enabled()
+        except Exception as e:
+            st.error(f"관리자 목록을 불러오지 못했습니다: {e}")
+
     # Initialize session state for signatures
     if 'signatures' not in st.session_state:
         st.session_state.signatures = {}
@@ -878,7 +924,27 @@ if page == "👷 현장 작업자":
             key="worker_count",
             help="작업 인원을 숫자로 입력하세요.",
         )
-        # 담당자(관리자)는 현장 작업자가 아니라 관리자 페이지에서 제출 건별로 지정한다.
+        manager_by_id = {
+            manager["id"]: manager for manager in available_managers
+        }
+        selected_manager_id = st.selectbox(
+            "담당 관리자",
+            options=[None, *manager_by_id.keys()],
+            format_func=lambda manager_id: (
+                "선택해 주세요"
+                if manager_id is None
+                else f"{manager_by_id[manager_id]['name']} ({manager_by_id[manager_id]['email']})"
+            ),
+            key="selected_manager_id",
+            help="허가서 제출 내용을 전달받을 담당 관리자를 선택하세요.",
+        )
+        selected_manager = manager_by_id.get(selected_manager_id)
+        if not available_managers:
+            st.warning("등록된 관리자가 없습니다. 관리자 페이지에서 관리자를 먼저 등록해 주세요.")
+        elif auto_email_enabled:
+            st.caption("제출하면 선택한 관리자에게 알림 메일이 자동 발송됩니다.")
+        else:
+            st.caption("현재 관리자 알림 메일 자동 발송은 꺼져 있습니다.")
 
     # Section 2: 작업 내용
     st.markdown('<div class="section-header">📝 작업 내용</div>', unsafe_allow_html=True)
@@ -890,7 +956,7 @@ if page == "👷 현장 작업자":
 
     def signature_canvas(key, label):
         st.markdown(f"**{label}**")
-        canvas_result = st_canvas(
+        canvas_options = dict(
             fill_color="rgba(255, 165, 0, 0.3)",
             stroke_width=3,
             stroke_color="#000000",
@@ -901,9 +967,11 @@ if page == "👷 현장 작업자":
             width=320,
             drawing_mode="freedraw",
             point_display_radius=0,
-            return_image_data=True,
             key=key,
         )
+        if "return_image_data" in inspect.signature(st_canvas).parameters:
+            canvas_options["return_image_data"] = True
+        canvas_result = st_canvas(**canvas_options)
         if canvas_result.image_data is not None:
             st.session_state.signatures[key] = canvas_result.image_data
         return canvas_result
@@ -1133,6 +1201,8 @@ if page == "👷 현장 작업자":
             ]
 
             validation_errors = []
+            if selected_manager is None:
+                validation_errors.append("담당 관리자를 선택해 주세요.")
             if start_error:
                 validation_errors.append(f"작업 시작 시간: {start_error}")
             if end_error:
@@ -1165,7 +1235,6 @@ if page == "👷 현장 작업자":
                 'worker_position': worker_position,
                 'worker_name': worker_name,
                 'worker_count': int(worker_count) if worker_count else None,
-                'manager_name': None,  # 담당자(관리자)는 관리자 페이지에서 나중에 지정
                 'work_description': work_description,
                 'special_notes': special_notes,
                 'power_outage_location': None if power_outage_location == "선택 안 함" else power_outage_location,
@@ -1180,6 +1249,9 @@ if page == "👷 현장 작업자":
                 'gas_measurements': [],
                 'signatures': st.session_state.signatures
             }
+            form_data = attach_manager_notification(
+                form_data, selected_manager, auto_email_enabled
+            )
             
             # Collect safety checks
             for category in visible_safety_categories:
@@ -1242,8 +1314,41 @@ if page == "👷 현장 작업자":
                         form_data['safety_text_fields'][field] = str(value)
             
             # Save form
-            if save_form(form_data):
+            saved_document_id = save_form(form_data)
+            if saved_document_id:
                 st.success("✅ 안전작업허가서가 제출되었습니다!")
+                if form_data['email_notification_requested']:
+                    try:
+                        smtp_config = resolve_smtp_config(st.secrets, os.environ)
+                        with st.spinner("담당 관리자에게 알림 메일을 보내는 중..."):
+                            send_submission_email(
+                                form_data,
+                                smtp_config,
+                                attachments=build_excel_email_attachments(form_data),
+                            )
+                        status_saved = update_form_fields(
+                            form_data['id'],
+                            {
+                                'email_status': 'sent',
+                                'email_sent_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                'email_error': None,
+                            },
+                            doc_id=saved_document_id,
+                        )
+                        st.success(f"📧 {form_data['manager_name']} 관리자에게 알림 메일을 보냈습니다.")
+                        if not status_saved:
+                            st.warning("메일은 발송했지만 발송 상태를 저장하지 못했습니다.")
+                    except Exception as e:
+                        error_message = f"{type(e).__name__}: {str(e)[:500]}"
+                        update_form_fields(
+                            form_data['id'],
+                            {'email_status': 'failed', 'email_error': error_message},
+                            doc_id=saved_document_id,
+                        )
+                        st.warning(
+                            "허가서는 저장되었지만 관리자 알림 메일을 보내지 못했습니다. "
+                            "관리자에게 SMTP 설정을 확인해 달라고 요청해 주세요."
+                        )
                 st.balloons()
 
     with col2:
@@ -1259,7 +1364,7 @@ if page == "👷 현장 작업자":
     st.markdown('<div class="section-header">📊 입력 내용 요약</div>', unsafe_allow_html=True)
 
     summary_data = {
-        "항목": ["작업일자", "작업 시작~종료", "작업장소", "작업대상", "공사명(허가번호)", "작업종류", "업체명", "성명", "직책", "작업자(명)"],
+        "항목": ["작업일자", "작업 시작~종료", "작업장소", "작업대상", "공사명(허가번호)", "작업종류", "업체명", "성명", "직책", "작업자(명)", "담당 관리자"],
         "내용": [
             work_date,
             f"{permit_start_time or '-'} ~ {permit_end_time or '-'}",
@@ -1270,7 +1375,8 @@ if page == "👷 현장 작업자":
             company_name,
             worker_name,
             worker_position,
-            worker_count if worker_count else ""
+            worker_count if worker_count else "",
+            selected_manager['name'] if selected_manager else ""
         ]
     }
 
@@ -1353,6 +1459,132 @@ else:
 
     st.title("👨‍💼 관리자 페이지")
     st.markdown("---")
+
+    st.markdown("### 👥 관리자 및 메일 알림 관리")
+    admin_managers = []
+    if manager_repository is None:
+        st.error("Firebase에 연결되지 않아 관리자 정보를 관리할 수 없습니다.")
+    else:
+        try:
+            current_auto_email_enabled = notification_settings_repository.is_enabled()
+            with st.form("email_notification_settings_form"):
+                auto_email_checkbox = st.checkbox(
+                    "작업자가 제출하면 선택한 관리자에게 메일 자동 발송",
+                    value=current_auto_email_enabled,
+                    key=f"admin_auto_email_enabled_{current_auto_email_enabled}",
+                    help="켜면 작업자가 선택한 담당 관리자에게 제출 요약 메일을 즉시 보냅니다.",
+                )
+                save_email_setting = st.form_submit_button(
+                    "메일 설정 저장", use_container_width=True
+                )
+            if save_email_setting:
+                notification_settings_repository.set_enabled(auto_email_checkbox)
+                st.success(
+                    "자동 메일 발송을 켰습니다."
+                    if auto_email_checkbox
+                    else "자동 메일 발송을 껐습니다."
+                )
+
+            if auto_email_checkbox:
+                try:
+                    resolve_smtp_config(st.secrets, os.environ)
+                    st.caption("✅ SMTP 발송 설정이 확인되었습니다.")
+                except ValueError as e:
+                    st.warning(f"메일을 보내려면 SMTP 설정이 필요합니다. ({e})")
+
+            with st.expander("➕ 관리자 등록", expanded=False):
+                with st.form("manager_create_form", clear_on_submit=True):
+                    new_manager_name = st.text_input("이름", key="new_manager_name")
+                    new_manager_email = st.text_input(
+                        "메일주소", key="new_manager_email", placeholder="manager@example.com"
+                    )
+                    new_manager_team_leader_name = st.text_input(
+                        "팀장명", key="new_manager_team_leader_name"
+                    )
+                    create_manager_submitted = st.form_submit_button(
+                        "관리자 등록", use_container_width=True, type="primary"
+                    )
+                if create_manager_submitted:
+                    try:
+                        manager_repository.create(
+                            new_manager_name,
+                            new_manager_email,
+                            new_manager_team_leader_name,
+                        )
+                        st.success("관리자를 등록했습니다.")
+                    except ValueError as e:
+                        st.error(str(e))
+                    except Exception as e:
+                        st.error(f"관리자를 등록하지 못했습니다: {e}")
+
+            admin_managers = manager_repository.list_all()
+            if not admin_managers:
+                st.info("등록된 관리자가 없습니다.")
+            else:
+                st.markdown(f"**등록된 관리자 ({len(admin_managers)}명)**")
+                for manager in admin_managers:
+                    with st.expander(f"{manager['name']} · {manager['email']}"):
+                        with st.form(f"manager_edit_form_{manager['id']}"):
+                            edit_col1, edit_col2, edit_col3 = st.columns(3)
+                            with edit_col1:
+                                edited_name = st.text_input(
+                                    "이름",
+                                    value=manager['name'],
+                                    key=f"manager_name_{manager['id']}",
+                                )
+                            with edit_col2:
+                                edited_email = st.text_input(
+                                    "메일주소",
+                                    value=manager['email'],
+                                    key=f"manager_email_{manager['id']}",
+                                )
+                            with edit_col3:
+                                edited_team_leader_name = st.text_input(
+                                    "팀장명",
+                                    value=manager.get('team_leader_name', ''),
+                                    key=f"manager_team_leader_name_{manager['id']}",
+                                )
+                            confirm_delete_manager = st.checkbox(
+                                "이 관리자를 삭제하려면 체크",
+                                key=f"manager_delete_confirm_{manager['id']}",
+                            )
+                            save_col, delete_col = st.columns(2)
+                            with save_col:
+                                save_manager_submitted = st.form_submit_button(
+                                    "수정 저장", use_container_width=True
+                                )
+                            with delete_col:
+                                delete_manager_submitted = st.form_submit_button(
+                                    "관리자 삭제", use_container_width=True
+                                )
+
+                        if save_manager_submitted:
+                            try:
+                                manager_repository.update(
+                                    manager['id'],
+                                    edited_name,
+                                    edited_email,
+                                    edited_team_leader_name,
+                                )
+                                st.success("관리자 정보를 수정했습니다.")
+                            except ValueError as e:
+                                st.error(str(e))
+                            except Exception as e:
+                                st.error(f"관리자 정보를 수정하지 못했습니다: {e}")
+
+                        if delete_manager_submitted:
+                            if not confirm_delete_manager:
+                                st.warning("삭제 확인란을 먼저 체크해 주세요.")
+                            else:
+                                try:
+                                    manager_repository.delete(manager['id'])
+                                    st.success(f"{manager['name']} 관리자를 삭제했습니다.")
+                                except Exception as e:
+                                    st.error(f"관리자를 삭제하지 못했습니다: {e}")
+        except Exception as e:
+            st.error(f"관리자 및 메일 설정을 불러오지 못했습니다: {e}")
+
+    st.markdown("---")
     
     # Load submitted forms
     forms = load_submitted_forms()
@@ -1361,9 +1593,49 @@ else:
         st.info("📭 제출된 안전작업허가서가 없습니다.")
     else:
         st.markdown(f"### 📋 제출된 양식 ({len(forms)}건)")
+        display_forms = list(reversed(forms))
+        form_rows = [
+            (form_instance_key(form, index), form)
+            for index, form in enumerate(display_forms)
+        ]
+        selected_forms_to_delete = [
+            form
+            for form_key, form in form_rows
+            if st.session_state.get(f"select_delete_{form_key}", False)
+        ]
+
+        st.markdown("#### 선택 삭제")
+        selected_delete_count = len(selected_forms_to_delete)
+        st.caption(f"삭제할 양식 {selected_delete_count}건 선택됨")
+        confirm_selected_delete = st.checkbox(
+            "선택한 양식 삭제 확인",
+            key="confirm_delete_selected_forms",
+            disabled=selected_delete_count == 0,
+        )
+        if st.button(
+            f"선택한 양식 {selected_delete_count}건 삭제",
+            key="delete_selected_forms_button",
+            use_container_width=True,
+            disabled=selected_delete_count == 0 or not confirm_selected_delete,
+        ):
+            with st.spinner("선택한 Firebase 저장 기록 삭제 중..."):
+                deleted_count = delete_selected_forms(selected_forms_to_delete)
+            for form_key, _form in form_rows:
+                st.session_state.pop(f"select_delete_{form_key}", None)
+            forms = load_submitted_forms()
+            display_forms = list(reversed(forms))
+            form_rows = [
+                (form_instance_key(form, index), form)
+                for index, form in enumerate(display_forms)
+            ]
+            st.success(f"{deleted_count}건이 삭제되었습니다.")
         
         # Display forms in a table
-        for i, form in enumerate(reversed(forms)):
+        for form_key, form in form_rows:
+            st.checkbox(
+                f"삭제 선택: {form['submitted_at']} - {form['work_location']}",
+                key=f"select_delete_{form_key}",
+            )
             with st.expander(f"📄 {form['submitted_at']} - {form['work_location']} ({form['work_type']})"):
                 col1, col2 = st.columns(2)
                 
@@ -1385,43 +1657,95 @@ else:
                     if form.get('power_outage_location'):
                         st.markdown(f"**정전 차단 위치:** {form['power_outage_location']}")
 
-                # 담당자(관리자) 지정 - 현장 제출 화면이 아니라 여기서 관리자가 직접 이름을 입력/저장
-                st.markdown("**담당자(관리자) 지정:**")
-                current_manager = form.get('manager_name') or ""
+                # 작업자가 선택한 담당자를 보여 주고, 필요하면 등록된 관리자로 변경한다.
+                st.markdown("**담당자(관리자):**")
+                current_manager = form.get('manager_name') or "미지정"
+                current_manager_email = form.get('manager_email') or "메일주소 없음"
+                st.caption(f"현재 담당자: {current_manager} · {current_manager_email}")
+                manager_by_id = {
+                    manager['id']: manager for manager in admin_managers
+                }
+                current_manager_id = form.get('manager_id')
+                if current_manager_id not in manager_by_id:
+                    current_manager_id = next(
+                        (
+                            manager['id']
+                            for manager in admin_managers
+                            if manager['name'] == form.get('manager_name')
+                            and manager['email'] == form.get('manager_email')
+                        ),
+                        None,
+                    )
+                manager_options = [None, *manager_by_id.keys()]
                 col_m1, col_m2 = st.columns([3, 1])
                 with col_m1:
-                    manager_input = st.text_input(
+                    manager_input = st.selectbox(
                         "담당자",
-                        value=current_manager,
-                        key=f"manager_input_{form['id']}",
+                        options=manager_options,
+                        index=manager_options.index(current_manager_id),
+                        format_func=lambda manager_id: (
+                            "담당자 해제"
+                            if manager_id is None
+                            else f"{manager_by_id[manager_id]['name']} ({manager_by_id[manager_id]['email']})"
+                        ),
+                        key=f"manager_input_{form_key}",
                         label_visibility="collapsed",
-                        placeholder="담당자 이름 입력",
                     )
                 with col_m2:
-                    if st.button("저장", key=f"manager_save_{form['id']}", use_container_width=True):
-                        value_to_save = manager_input.strip() or None
+                    if st.button("저장", key=f"manager_save_{form_key}", use_container_width=True):
+                        selected_admin_manager = manager_by_id.get(manager_input)
+                        manager_updates = {
+                            'manager_id': (
+                                selected_admin_manager['id'] if selected_admin_manager else None
+                            ),
+                            'manager_name': (
+                                selected_admin_manager['name'] if selected_admin_manager else None
+                            ),
+                            'manager_email': (
+                                selected_admin_manager['email'] if selected_admin_manager else None
+                            ),
+                            'team_leader_name': (
+                                selected_admin_manager.get('team_leader_name', '')
+                                if selected_admin_manager
+                                else None
+                            ),
+                        }
                         with st.spinner("담당자 저장 중..."):
-                            manager_saved = update_manager_name(
-                                form['id'], value_to_save, doc_id=form.get('_doc_id')
+                            manager_saved = update_form_fields(
+                                form['id'], manager_updates, doc_id=form.get('_doc_id')
                             )
                         if manager_saved:
-                            form['manager_name'] = value_to_save
+                            form.update(manager_updates)
                             st.success("담당자가 저장되었습니다.")
+
+                email_status_labels = {
+                    'pending': '발송 대기',
+                    'sent': '발송 완료',
+                    'failed': '발송 실패',
+                    'disabled': '자동 발송 꺼짐',
+                }
+                email_status = form.get('email_status')
+                if email_status:
+                    st.markdown(
+                        f"**메일 상태:** {email_status_labels.get(email_status, email_status)}"
+                    )
+                    if email_status == 'failed' and form.get('email_error'):
+                        st.caption(f"실패 사유: {form['email_error']}")
 
                 # 승인자(팀장) 지정 - Excel 결과물 생성 시점에 관리자가 직접 이름을 입력/저장
                 st.markdown("**승인자(팀장) 지정:**")
-                current_approver = form.get('approver_name') or ""
+                current_approver = resolve_approver_name(form)
                 col_a1, col_a2 = st.columns([3, 1])
                 with col_a1:
                     approver_input = st.text_input(
                         "승인자(팀장)",
                         value=current_approver,
-                        key=f"approver_input_{form['id']}",
+                        key=f"approver_input_{form_key}",
                         label_visibility="collapsed",
                         placeholder="승인자(팀장) 이름 입력",
                     )
                 with col_a2:
-                    if st.button("저장", key=f"approver_save_{form['id']}", use_container_width=True):
+                    if st.button("저장", key=f"approver_save_{form_key}", use_container_width=True):
                         value_to_save = approver_input.strip() or None
                         with st.spinner("승인자 저장 중..."):
                             approver_saved = update_form_fields(
@@ -1468,10 +1792,10 @@ else:
                     st.markdown(f"**특별사항:** {form['special_notes']}")
                 
                 # Action buttons for each form
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
                 
                 with col1:
-                    if st.button(f"📥 Excel 다운로드", key=f"download_{form['id']}", use_container_width=True):
+                    if st.button(f"📥 Excel 다운로드", key=f"download_{form_key}", use_container_width=True):
                         excel_data = fill_excel_template(form)
                         if excel_data:
                             st.download_button(
@@ -1484,29 +1808,24 @@ else:
                             st.error("❌ Excel 템플릿을 찾을 수 없습니다.")
                 
                 with col2:
-                    if st.button(f"🖨️ 인쇄", key=f"print_{form['id']}", use_container_width=True):
+                    if st.button(f"🖨️ 인쇄", key=f"print_{form_key}", use_container_width=True):
                         st.info("📄 Excel 다운로드 후 인쇄하세요.")
                 
-                with col3:
-                    if st.button(f"🗑️ 삭제", key=f"delete_{form['id']}", use_container_width=True):
-                        delete_form(form['id'])
-                        st.rerun()
-        
         # Bulk actions
         st.markdown("---")
-        st.markdown("### 🔧 전체 관리")
+        st.markdown("### Firebase 저장 기록 관리")
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("🗑️ 전체 삭제", use_container_width=True):
+            if st.button("Firebase 저장 기록 전체 삭제", use_container_width=True):
                 st.session_state.confirm_delete_all_forms = True
 
             if st.session_state.get('confirm_delete_all_forms'):
-                st.warning("정말 모든 양식을 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.")
+                st.warning("정말 Firebase에 저장된 모든 허가서 기록을 삭제할까요? 이 작업은 되돌릴 수 없습니다.")
                 confirm_col, cancel_col = st.columns(2)
                 with confirm_col:
                     if st.button("삭제 확정", key="confirm_delete_all_forms_button", use_container_width=True, type="primary"):
-                        with st.spinner("전체 양식 삭제 중..."):
+                        with st.spinner("Firebase 저장 기록 삭제 중..."):
                             deleted_count = delete_all_forms()
                         if deleted_count is not None:
                             st.session_state.confirm_delete_all_forms = False
