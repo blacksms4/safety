@@ -1,26 +1,6 @@
 streamlit
+streamlit-drawable-canvas[image]==0.13.0
 openpyxl
 Pillow
 numpy
 firebase-admin
-
-try:
-    firebase_creds = {
-        "type": st.secrets.STREAMLIT_FIREBASE_TYPE,
-        "project_id": st.secrets.STREAMLIT_FIREBASE_PROJECT_ID,
-        "private_key_id": st.secrets.STREAMLIT_FIREBASE_PRIVATE_KEY_ID,
-        "private_key": st.secrets.STREAMLIT_FIREBASE_PRIVATE_KEY,
-        "client_email": st.secrets.STREAMLIT_FIREBASE_CLIENT_EMAIL,
-        "client_id": st.secrets.STREAMLIT_FIREBASE_CLIENT_ID,
-        "auth_uri": st.secrets.STREAMLIT_FIREBASE_AUTH_URI,
-        "token_uri": st.secrets.STREAMLIT_FIREBASE_TOKEN_URI,
-        "auth_provider_x509_cert_url": st.secrets.STREAMLIT_FIREBASE_AUTH_PROVIDER_X509_CERT_URL,
-        "client_x509_cert_url": st.secrets.STREAMLIT_FIREBASE_CLIENT_X509_CERT_URL,
-    }
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(firebase_creds)
-        firebase_admin.initialize_app(cred)
-    db = firestore.client()
-except Exception as e:
-    st.error(f"Firebase initialization error: {e}")
-    db = None
