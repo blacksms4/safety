@@ -9,20 +9,32 @@ from email.message import EmailMessage
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
-def validate_manager(name, email, team_leader_name=None):
+def validate_manager(
+    name, email, team_leader_name=None, team_leader_department=None
+):
     """관리자 입력값을 검증하고 저장 가능한 형태로 정규화한다."""
     normalized_name = str(name or "").strip()
     normalized_email = str(email or "").strip().lower()
     normalized_team_leader_name = str(team_leader_name or "").strip()
+    normalized_team_leader_department = str(
+        team_leader_department or ""
+    ).strip()
 
     if not normalized_name:
         raise ValueError("관리자 이름을 입력해 주세요.")
     if not _EMAIL_PATTERN.fullmatch(normalized_email):
         raise ValueError("올바른 메일주소를 입력해 주세요.")
+    if team_leader_name is not None or team_leader_department is not None:
+        if not normalized_team_leader_name:
+            raise ValueError("승인자(팀장) 이름을 입력해 주세요.")
+        if not normalized_team_leader_department:
+            raise ValueError("승인자(팀장) 부서를 입력해 주세요.")
 
     manager = {"name": normalized_name, "email": normalized_email}
     if team_leader_name is not None:
         manager["team_leader_name"] = normalized_team_leader_name
+    if team_leader_department is not None:
+        manager["team_leader_department"] = normalized_team_leader_department
     return manager
 
 
@@ -35,6 +47,9 @@ def attach_manager_notification(form_data, manager, enabled):
             "manager_name": manager["name"],
             "manager_email": manager["email"],
             "team_leader_name": manager.get("team_leader_name", ""),
+            "team_leader_department": manager.get(
+                "team_leader_department", ""
+            ),
             "email_notification_requested": bool(enabled),
             "email_status": "pending" if enabled else "disabled",
         }
@@ -169,26 +184,55 @@ class ManagerRepository:
                 }
                 if "team_leader_name" in data:
                     manager["team_leader_name"] = data.get("team_leader_name", "")
+                if "team_leader_department" in data:
+                    manager["team_leader_department"] = data.get(
+                        "team_leader_department", ""
+                    )
                 managers.append(manager)
         return sorted(managers, key=lambda manager: manager["name"].casefold())
 
-    def create(self, name, email, team_leader_name=None):
-        manager = validate_manager(name, email, team_leader_name)
+    def create(
+        self,
+        name,
+        email,
+        team_leader_name=None,
+        team_leader_department=None,
+    ):
+        manager = validate_manager(
+            name, email, team_leader_name, team_leader_department
+        )
         for existing_manager in self.list_all():
             if (
                 existing_manager["name"].casefold() == manager["name"].casefold()
                 and existing_manager["email"].casefold() == manager["email"].casefold()
             ):
-                if manager.get("team_leader_name"):
+                leader_updates = {
+                    key: manager[key]
+                    for key in (
+                        "team_leader_name",
+                        "team_leader_department",
+                    )
+                    if manager.get(key)
+                }
+                if leader_updates:
                     self._collection.document(existing_manager["id"]).update(
-                        {"team_leader_name": manager["team_leader_name"]}
+                        leader_updates
                     )
                 return existing_manager["id"]
         _write_time, reference = self._collection.add(manager)
         return reference.id
 
-    def update(self, manager_id, name, email, team_leader_name=None):
-        manager = validate_manager(name, email, team_leader_name)
+    def update(
+        self,
+        manager_id,
+        name,
+        email,
+        team_leader_name=None,
+        team_leader_department=None,
+    ):
+        manager = validate_manager(
+            name, email, team_leader_name, team_leader_department
+        )
         self._collection.document(manager_id).update(manager)
 
     def delete(self, manager_id):
