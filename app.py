@@ -32,6 +32,24 @@ st.set_page_config(
 
 # Data storage
 EXCEL_TEMPLATE = "안전작업허가서.xlsx"
+CONFINED_SPACE_TEMPLATE = os.path.join(
+    "outputs", "confined_space_permit", "밀폐공간작업 작업 허가서.xlsx"
+)
+
+CONFINED_SPACE_SAFETY_ITEMS = [
+    "관리감독자 지정 및 감시인 배치",
+    "밀폐공간작업 관계자외 출입금지 표지판 게시",
+    "밸브차단, 맹판 설치, 불활성 가스 치환, 용기세정",
+    "전기회로, 기계장비 가동장치, 유압, 압축공기 잠금 및 시건조치",
+    "산소 및 유해가스 측정",
+    "환기시설 설치 및 환기 실시여부",
+    "전화 및 무선기기 구비",
+    "방폭형 전기기계기구의 사용",
+    "소화기 비치",
+    "공기호흡기 또는 송기마스크 비치",
+    "필요한 안전장구 구비",
+    "안전보건교육 실시",
+]
 
 # Initialize Firebase
 try:
@@ -140,6 +158,382 @@ def resolve_approver_name(form_data):
         or form_data.get("team_leader_name")
         or ""
     ).strip()
+
+
+def is_confined_space_work(form_data):
+    """Return whether a saved or newly submitted form includes confined work."""
+    selected_work_types = form_data.get("work_types") or []
+    if isinstance(selected_work_types, str):
+        selected_work_types = [
+            item.strip() for item in selected_work_types.split(",") if item.strip()
+        ]
+    if "밀폐작업" in selected_work_types:
+        return True
+    return "밀폐작업" in str(form_data.get("work_type") or "")
+
+
+def build_confined_space_cell_mapping(form_data):
+    """Map a submitted confined-space permit to the editable Excel template."""
+    confined_data = form_data.get("confined_space") or {}
+    work_date_text = str(form_data.get("work_date") or "")
+    try:
+        work_date = datetime.strptime(work_date_text, "%Y-%m-%d")
+        date_label = f"{work_date.year}년 {work_date.month}월 {work_date.day}일"
+    except ValueError:
+        date_label = work_date_text
+
+    start_time = str(form_data.get("permit_start_time") or "")
+    end_time = str(form_data.get("permit_end_time") or "")
+
+    def time_label(value):
+        parts = value.split(":", 1)
+        if len(parts) == 2 and all(part.isdigit() for part in parts):
+            return f"{int(parts[0]):02d}시 {int(parts[1]):02d}분"
+        return value
+
+    mapping = {
+        "C2": str(form_data.get("company_name") or ""),
+        "F2": str(form_data.get("worker_position") or ""),
+        "H2": (
+            f"{form_data.get('worker_name')}          (서명)"
+            if form_data.get("worker_name")
+            else ""
+        ),
+        "B3": f"{date_label} {time_label(start_time)} ~ {time_label(end_time)}".strip(),
+        "F3": f"{date_label} {time_label(end_time)}".strip(),
+        "B4": str(form_data.get("work_location") or ""),
+        "F4": str(confined_data.get("internal_contact") or ""),
+        "B5": str(form_data.get("work_description") or ""),
+        "A30": str(confined_data.get("special_actions") or ""),
+    }
+
+    safety_results = confined_data.get("safety_results") or {}
+    for row_number, item in enumerate(CONFINED_SPACE_SAFETY_ITEMS, start=10):
+        result = str(safety_results.get(item) or "").strip()
+        if not result or result == "선택 안 함":
+            continue
+        mapping[f"E{row_number}"] = "□" if result == "해당 없음" else "☑"
+        mapping[f"G{row_number}"] = result
+
+    for row_number, measurement in zip(
+        range(24, 29), confined_data.get("gas_measurements") or []
+    ):
+        if not isinstance(measurement, dict):
+            continue
+        mapping[f"A{row_number}"] = str(measurement.get("material_name") or "")
+        mapping[f"B{row_number}"] = str(measurement.get("concentration") or "")
+        mapping[f"C{row_number}"] = str(measurement.get("measurement_time") or "")
+        mapping[f"D{row_number}"] = str(measurement.get("measurer_name") or "")
+
+    supervisors = [
+        dict(person)
+        for person in (confined_data.get("supervisors") or [])
+        if isinstance(person, dict)
+    ]
+    approver_name = str(
+        form_data.get("team_leader_name")
+        or form_data.get("approver_name")
+        or confined_data.get("final_approver_name")
+        or ""
+    ).strip()
+    if approver_name:
+        if supervisors:
+            supervisors[0].update(
+                {"position": "관리감독자", "name": approver_name}
+            )
+        else:
+            supervisors.append(
+                {"position": "관리감독자", "name": approver_name}
+            )
+    if supervisors:
+        supervisors[0]["position"] = "관리감독자"
+    supervisors = supervisors[:1]
+
+    watchers = [
+        dict(person)
+        for person in (confined_data.get("watchers") or [])
+        if isinstance(person, dict)
+    ]
+    current_manager_name = str(form_data.get("manager_name") or "").strip()
+    if current_manager_name:
+        if watchers:
+            watchers[0].update(
+                {"position": "감시인", "name": current_manager_name}
+            )
+        else:
+            watchers.append(
+                {"position": "감시인", "name": current_manager_name}
+            )
+    if watchers:
+        watchers[0]["position"] = "감시인"
+    watchers = watchers[:1]
+
+    person_groups = [
+        (35, supervisors),
+        (36, watchers),
+    ]
+    workers = [
+        {**person, "position": "작업자"}
+        for person in (confined_data.get("workers") or [])
+        if isinstance(person, dict)
+    ]
+    person_groups.extend([(37, workers[:3]), (38, workers[3:6])])
+    position_cells = ["A", "C", "E"]
+    name_cells = ["B", "D", "F"]
+    for row_number, people in person_groups:
+        for slot, person in enumerate(people[:3]):
+            if not isinstance(person, dict):
+                continue
+            mapping[f"{position_cells[slot]}{row_number}"] = str(
+                person.get("position") or ""
+            )
+            person_name = str(person.get("name") or "")
+            mapping[f"{name_cells[slot]}{row_number}"] = (
+                f"{person_name}          (서명)" if person_name else ""
+            )
+
+    final_department = str(
+        form_data.get("team_leader_department")
+        or confined_data.get("final_department")
+        or ""
+    )
+    mapping["B39"] = (
+        f"{date_label} : 부서 ({final_department}), 직책 (팀장), "
+        f"성명 ({approver_name})    (서명)"
+    )
+    return mapping
+
+
+def adjust_confined_additional_worker_count(current_count, delta):
+    """Increase or decrease additional workers within the six-person template."""
+    try:
+        normalized_count = int(current_count)
+    except (TypeError, ValueError):
+        normalized_count = 0
+    return max(0, min(5, normalized_count + int(delta)))
+
+
+def build_confined_space_payload(session_values, shared_data):
+    """Collect the conditional confined-space fields into one saved payload."""
+    safety_results = {
+        item: str(session_values.get(f"confined_safety_{index}") or "선택 안 함")
+        for index, item in enumerate(CONFINED_SPACE_SAFETY_ITEMS, start=1)
+    }
+
+    gas_measurements = []
+    for index in range(1, 6):
+        measurement_time = session_values.get(f"gas_{index}_measurement_time")
+        if hasattr(measurement_time, "strftime"):
+            measurement_time = measurement_time.strftime("%H:%M")
+        gas_measurements.append(
+            {
+                "material_name": str(
+                    session_values.get(f"gas_{index}_material_name")
+                    or ""
+                ).strip(),
+                "concentration": str(
+                    session_values.get(f"gas_{index}_concentration")
+                    or ""
+                ).strip(),
+                "measurement_time": str(measurement_time or "").strip(),
+                "measurer_name": str(
+                    session_values.get(f"gas_{index}_measurer_name")
+                    or ""
+                ).strip(),
+            }
+        )
+
+    manager_name = str(shared_data.get("manager_name") or "").strip()
+    team_leader_name = str(
+        shared_data.get("team_leader_name") or ""
+    ).strip()
+    supervisors = []
+    if team_leader_name:
+        supervisors.append(
+            {"position": "관리감독자", "name": team_leader_name}
+        )
+
+    watchers = []
+    if manager_name:
+        watchers.append(
+            {"position": "감시인", "name": manager_name}
+        )
+
+    workers = []
+    worker_position = str(shared_data.get("worker_position") or "").strip()
+    worker_name = str(shared_data.get("worker_name") or "").strip()
+    if worker_position or worker_name:
+        workers.append({"position": "작업자", "name": worker_name})
+    additional_worker_count = adjust_confined_additional_worker_count(
+        session_values.get("confined_additional_worker_count", 0), 0
+    )
+    for index in range(2, 2 + additional_worker_count):
+        additional_worker_name = str(
+            session_values.get(f"confined_worker_{index}_name") or ""
+        ).strip()
+        if additional_worker_name:
+            workers.append(
+                {"position": "작업자", "name": additional_worker_name}
+            )
+
+    return {
+        "internal_contact": str(
+            session_values.get("confined_internal_contact") or ""
+        ).strip(),
+        "safety_results": safety_results,
+        "gas_measurements": gas_measurements,
+        "special_actions": str(
+            session_values.get("confined_special_actions") or ""
+        ).strip(),
+        "supervisors": supervisors,
+        "watchers": watchers,
+        "workers": workers,
+        "final_department": str(
+            shared_data.get("team_leader_department") or ""
+        ).strip(),
+        "final_position": "팀장",
+        "final_approver_name": team_leader_name,
+    }
+
+
+def confined_payload_to_safety_fields(confined_data):
+    """Reuse confined permit inputs in the matching safety-permit fields."""
+    safety_results = confined_data.get("safety_results") or {}
+    safety_checks = {
+        "해당": True,
+        "통신수단": safety_results.get("전화 및 무선기기 구비") == "적합",
+        "구명장구(줄, 송기마스크)": (
+            safety_results.get("공기호흡기 또는 송기마스크 비치") == "적합"
+        ),
+    }
+    gas_measurements = []
+    for measurement in confined_data.get("gas_measurements") or []:
+        if not isinstance(measurement, dict):
+            continue
+        gas_measurements.append(
+            {
+                "material_name": str(measurement.get("material_name") or ""),
+                "result": str(measurement.get("concentration") or ""),
+                "measurement_time": str(
+                    measurement.get("measurement_time") or ""
+                ),
+                "measurer_confirmer": str(
+                    measurement.get("measurer_name") or ""
+                ),
+            }
+        )
+    return safety_checks, gas_measurements
+
+
+def validate_confined_space_payload(
+    confined_data, start_time, end_time, shared_data=None
+):
+    """Validate the additional safety inputs required for confined work."""
+    errors = []
+    safety_results = confined_data.get("safety_results") or {}
+    if any(
+        safety_results.get(item) in (None, "", "선택 안 함")
+        for item in CONFINED_SPACE_SAFETY_ITEMS
+    ):
+        errors.append("밀폐공간 안전보건조치 12개 항목을 모두 선택해 주세요.")
+    if any(
+        safety_results.get(item) == "부적합"
+        for item in CONFINED_SPACE_SAFETY_ITEMS
+    ):
+        errors.append(
+            "부적합으로 확인된 밀폐공간 안전조치를 먼저 보완해 주세요."
+        )
+
+    complete_measurements = 0
+    has_partial_measurement = False
+    for measurement in confined_data.get("gas_measurements") or []:
+        if not isinstance(measurement, dict):
+            continue
+        values = [
+            str(measurement.get(field) or "").strip()
+            for field in (
+                "material_name",
+                "concentration",
+                "measurement_time",
+                "measurer_name",
+            )
+        ]
+        filled_count = sum(bool(value) for value in values)
+        if filled_count == len(values):
+            complete_measurements += 1
+        elif filled_count:
+            has_partial_measurement = True
+    if has_partial_measurement:
+        errors.append("가스측정 행은 네 항목을 모두 입력해 주세요.")
+    if complete_measurements == 0:
+        errors.append("완전하게 입력된 가스측정 결과가 1건 이상 필요합니다.")
+
+    watchers = confined_data.get("watchers") or []
+    complete_watchers = [
+        person
+        for person in watchers
+        if isinstance(person, dict)
+        and str(person.get("position") or "").strip()
+        and str(person.get("name") or "").strip()
+    ]
+    if not watchers:
+        errors.append("밀폐공간 감시인을 1명 이상 입력해 주세요.")
+    elif not complete_watchers:
+        errors.append("감시인의 직책과 이름을 모두 입력해 주세요.")
+
+    supervisors = confined_data.get("supervisors") or []
+    if (
+        not supervisors
+        or not isinstance(supervisors[0], dict)
+        or not str(supervisors[0].get("position") or "").strip()
+        or not str(supervisors[0].get("name") or "").strip()
+    ):
+        errors.append(
+            "관리감독자·최종 승인자로 사용할 승인자(팀장) 이름이 필요합니다."
+        )
+
+    if not str(confined_data.get("final_department") or "").strip():
+        errors.append(
+            "선택한 담당 관리자의 승인자(팀장) 부서를 관리자 명단에 등록해 주세요."
+        )
+
+    if shared_data is not None:
+        required_shared_fields = [
+            ("company_name", "업체명"),
+            ("worker_position", "직책"),
+            ("worker_name", "성명"),
+            ("work_location", "작업장소"),
+            ("work_description", "작업내용"),
+        ]
+        missing_labels = [
+            label
+            for field_name, label in required_shared_fields
+            if not str(shared_data.get(field_name) or "").strip()
+        ]
+        if missing_labels:
+            errors.append(
+                "밀폐공간 허가서 공통정보를 입력해 주세요: "
+                + ", ".join(missing_labels)
+            )
+
+    def minutes_since_midnight(value):
+        parts = str(value or "").split(":", 1)
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            return None
+        return int(parts[0]) * 60 + int(parts[1])
+
+    start_minutes = minutes_since_midnight(start_time)
+    end_minutes = minutes_since_midnight(end_time)
+    if start_minutes is None or end_minutes is None:
+        errors.append("밀폐공간 작업 시작·종료 시간을 입력해 주세요.")
+    else:
+        duration_minutes = end_minutes - start_minutes
+        if duration_minutes <= 0 or duration_minutes > 9 * 60:
+            errors.append(
+                "밀폐공간 작업시간은 휴게시간 1시간을 포함해 같은 날 기준 "
+                "9시간 이내여야 합니다."
+            )
+    return errors
 
 
 def get_admin_password():
@@ -781,18 +1175,119 @@ def fill_excel_template(form_data):
     return output
 
 
+def fill_confined_space_template(form_data):
+    """Fill the separate confined-space Excel permit from one submission."""
+    if not os.path.exists(CONFINED_SPACE_TEMPLATE):
+        return None
+
+    form_data = decode_form_signatures(form_data)
+    workbook = load_workbook(CONFINED_SPACE_TEMPLATE)
+    worksheet = workbook.active
+    for cell, value in build_confined_space_cell_mapping(form_data).items():
+        if value not in (None, ""):
+            worksheet[cell] = value
+
+    signature_data = (form_data.get("signatures") or {}).get("company_rep")
+    if signature_data is not None and not isinstance(signature_data, str):
+        try:
+            import numpy as np
+            from openpyxl.drawing.spreadsheet_drawing import (
+                AnchorMarker,
+                OneCellAnchor,
+            )
+            from openpyxl.drawing.xdr import XDRPositiveSize2D
+            from openpyxl.utils.units import pixels_to_EMU
+
+            signature_array = np.asarray(signature_data).astype("uint8")
+            signature_image = PILImage.fromarray(signature_array).convert("RGBA")
+            transparent_pixels = []
+            for pixel in signature_image.getdata():
+                if pixel[0] > 200 and pixel[1] > 200 and pixel[2] > 200:
+                    transparent_pixels.append((255, 255, 255, 0))
+                else:
+                    transparent_pixels.append(pixel)
+            signature_image.putdata(transparent_pixels)
+            signature_image = signature_image.resize((60, 16))
+            image_bytes = io.BytesIO()
+            signature_image.save(image_bytes, format="PNG")
+            png_data = image_bytes.getvalue()
+            signature_targets = (
+                {
+                    "cell": "H2",
+                    "column": 7,
+                    "row": 1,
+                    "offset": 75,
+                    "width": 50,
+                },
+                {
+                    "cell": "B37",
+                    "column": 1,
+                    "row": 36,
+                    "offset": 50,
+                    "width": 50,
+                },
+            )
+            for target in signature_targets:
+                image = OpenpyxlImage(io.BytesIO(png_data))
+                marker = AnchorMarker(
+                    col=target["column"],
+                    colOff=pixels_to_EMU(target["offset"]),
+                    row=target["row"],
+                    rowOff=pixels_to_EMU(4),
+                )
+                image.anchor = OneCellAnchor(
+                    _from=marker,
+                    ext=XDRPositiveSize2D(
+                        pixels_to_EMU(target["width"]), pixels_to_EMU(16)
+                    ),
+                )
+                worksheet.add_image(image)
+        except Exception as error:
+            print(f"Error adding confined-space signature: {error}")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
+
+
 def build_excel_email_attachments(form_data):
     excel_data = fill_excel_template(form_data)
     if not excel_data:
         return []
     content = excel_data.getvalue() if hasattr(excel_data, "getvalue") else excel_data
-    return [
+    attachments = [
         {
             "filename": f"safety_work_permit_{form_data.get('id', 'submission')}.xlsx",
             "content": content,
             "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }
     ]
+    if is_confined_space_work(form_data):
+        confined_excel_data = fill_confined_space_template(form_data)
+        if not confined_excel_data:
+            raise FileNotFoundError(
+                "밀폐공간작업 Excel 템플릿을 찾거나 생성하지 못했습니다."
+            )
+        confined_content = (
+            confined_excel_data.getvalue()
+            if hasattr(confined_excel_data, "getvalue")
+            else confined_excel_data
+        )
+        attachments.append(
+            {
+                "filename": (
+                    "confined_space_work_permit_"
+                    f"{form_data.get('id', 'submission')}.xlsx"
+                ),
+                "content": confined_content,
+                "mime_type": (
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            }
+        )
+    return attachments
 
 # Custom CSS
 st.markdown("""
@@ -1108,47 +1603,147 @@ if page == "👷 현장 작업자":
     risk_assessment_change = st.radio("작업절차서변화", ["선택 안 함", "유", "무"], key="risk_assessment_change", horizontal=True)
     risk_assessment_diff = st.radio("작업상이", ["선택 안 함", "유", "무"], key="risk_assessment_diff", horizontal=True)
 
-    # 밀폐공간은 밀폐작업 선택 시에만 표시한다.
-    is_confined_space_work = "밀폐작업" in work_types
-    if is_confined_space_work:
-        st.markdown('<div class="checkbox-group"><strong>밀폐공간</strong></div>', unsafe_allow_html=True)
-        confined_space_applies = st.checkbox("밀폐공간 작업 해당", key="check_밀폐공간_해당")
-        st.checkbox("통신수단", key="check_밀폐공간_통신수단")
-        st.checkbox("구명장구(줄, 송기마스크)", key="check_밀폐공간_구명장구(줄, 송기마스크)")
-        st.markdown("**밀폐공간 허가기간**")
-        st.info(f"{work_date} (작업일자와 동일)")
-        st.caption("참고자료: 가스농도 측정결과 1. HC: 0%, 2. O2: 18%이상, 3. CO: 30ppm미만, 4. CO2: 1.5%미만, 5. H2S: 10ppm미만")
+    # 별도 밀폐공간작업 허가서 입력란은 "밀폐작업"을 선택한 경우에만 표시한다.
+    is_confined_space_selected = "밀폐작업" in work_types
+    if is_confined_space_selected:
+        st.markdown(
+            '<div class="section-header">밀폐공간작업 허가서 추가 정보</div>',
+            unsafe_allow_html=True,
+        )
+        st.info(
+            "작업일시·장소·내용·업체·신청인·담당 관리자는 위 기본 정보를 "
+            "밀폐공간작업 허가서에도 자동으로 사용합니다."
+        )
+        st.text_input(
+            "내부 연락방법",
+            key="confined_internal_contact",
+            placeholder="예: 무전기 3번 채널, 휴대전화 번호",
+        )
 
-        if confined_space_applies:
-            st.markdown("#### 🧪 가스농도 측정")
-            st.caption("Excel 서식의 22~23행 좌·우 가스농도 측정란에 각각 입력됩니다.")
-            for measurement_index in range(1, 5):
-                st.markdown(f"**측정 {measurement_index}**")
-                gas_col1, gas_col2, gas_col3, gas_col4 = st.columns([2, 1.5, 1.5, 2])
-                with gas_col1:
-                    st.text_input(
-                        "물질명",
-                        key=f"gas_{measurement_index}_material_name",
-                        placeholder="예: O2, CO, H2S",
+        st.markdown("#### 안전보건조치 요구사항")
+        st.caption("각 항목의 확인 결과를 선택하세요.")
+        result_columns = st.columns(2)
+        for item_index, item in enumerate(CONFINED_SPACE_SAFETY_ITEMS, start=1):
+            with result_columns[(item_index - 1) % 2]:
+                st.selectbox(
+                    item,
+                    ["선택 안 함", "적합", "부적합", "해당 없음"],
+                    key=f"confined_safety_{item_index}",
+                )
+
+        st.markdown("#### 유해가스 측정결과")
+        st.caption(
+            "여기에 입력한 5개 측정값은 기존 안전작업허가서의 가스농도 측정란에도 "
+            "앞에서부터 자동 반영됩니다."
+        )
+        for measurement_index in range(1, 6):
+            st.markdown(f"**측정 {measurement_index}**")
+            gas_col1, gas_col2, gas_col3, gas_col4 = st.columns([2, 1.5, 1.5, 2])
+            with gas_col1:
+                st.text_input(
+                    "측정물질명",
+                    key=f"gas_{measurement_index}_material_name",
+                    placeholder="예: O2, CO, H2S",
+                )
+            with gas_col2:
+                st.text_input(
+                    "측정농도",
+                    key=f"gas_{measurement_index}_concentration",
+                    placeholder="예: 20.9%, 0ppm",
+                )
+            with gas_col3:
+                st.time_input(
+                    "측정시간",
+                    value=None,
+                    key=f"gas_{measurement_index}_measurement_time",
+                )
+            with gas_col4:
+                st.text_input(
+                    "측정자 성명",
+                    key=f"gas_{measurement_index}_measurer_name",
+                    placeholder="성명 입력",
+                )
+
+        st.text_area(
+            "특별조치 필요사항",
+            key="confined_special_actions",
+            height=100,
+            placeholder="필요한 특별조치를 상세히 입력하세요.",
+        )
+
+        with st.expander("작업자 정보 추가 입력", expanded=False):
+            auto_manager_name = (
+                selected_manager.get("name", "") if selected_manager else ""
+            )
+            auto_team_leader_name = (
+                selected_manager.get("team_leader_name", "")
+                if selected_manager
+                else ""
+            )
+            auto_team_leader_department = (
+                selected_manager.get("team_leader_department", "")
+                if selected_manager
+                else ""
+            )
+            st.caption(
+                "관리감독자와 최종 승인자는 승인자(팀장), 감시인은 담당 관리자로 "
+                "자동 입력됩니다. 신청인은 첫 번째 작업자로 자동 입력됩니다."
+            )
+            st.info(
+                f"관리감독자·최종 승인자: {auto_team_leader_name or '미등록'} "
+                f"({auto_team_leader_department or '부서 미등록'})\n\n"
+                f"감시인: 담당 관리자 {auto_manager_name or '미선택'}"
+            )
+
+            st.markdown("**추가 작업자**")
+            additional_worker_count = adjust_confined_additional_worker_count(
+                st.session_state.get("confined_additional_worker_count", 0), 0
+            )
+            st.session_state["confined_additional_worker_count"] = (
+                additional_worker_count
+            )
+            add_worker_col, remove_worker_col = st.columns(2)
+            with add_worker_col:
+                if st.button(
+                    "+ 작업자 추가",
+                    key="add_confined_worker",
+                    use_container_width=True,
+                    disabled=additional_worker_count >= 5,
+                ):
+                    additional_worker_count = (
+                        adjust_confined_additional_worker_count(
+                            additional_worker_count, 1
+                        )
                     )
-                with gas_col2:
-                    st.text_input(
-                        "결과",
-                        key=f"gas_{measurement_index}_result",
-                        placeholder="예: 20.9%, 0ppm",
+                    st.session_state["confined_additional_worker_count"] = (
+                        additional_worker_count
                     )
-                with gas_col3:
-                    st.time_input(
-                        "측정시간",
-                        value=None,
-                        key=f"gas_{measurement_index}_measurement_time",
+            with remove_worker_col:
+                if st.button(
+                    "마지막 작업자 삭제",
+                    key="remove_confined_worker",
+                    use_container_width=True,
+                    disabled=additional_worker_count <= 0,
+                ):
+                    removed_person_index = additional_worker_count + 1
+                    st.session_state.pop(
+                        f"confined_worker_{removed_person_index}_name", None
                     )
-                with gas_col4:
-                    st.text_input(
-                        "측정자/확인자",
-                        key=f"gas_{measurement_index}_measurer_confirmer",
-                        placeholder="성명 입력",
+                    additional_worker_count = (
+                        adjust_confined_additional_worker_count(
+                            additional_worker_count, -1
+                        )
                     )
+                    st.session_state["confined_additional_worker_count"] = (
+                        additional_worker_count
+                    )
+
+            for additional_index in range(additional_worker_count):
+                person_index = additional_index + 2
+                st.text_input(
+                    f"추가 작업자 {additional_index + 1} 이름",
+                    key=f"confined_worker_{person_index}_name",
+                )
 
     # 정전 항목은 전기작업 선택 시에만 표시한다.
     is_power_outage_work = "전기작업" in work_types
@@ -1199,6 +1794,28 @@ if page == "👷 현장 작업자":
                 for category, check in required_safety_checks
                 if not st.session_state.get(f"check_{category}_{check}", False)
             ]
+            confined_data = None
+            if is_confined_space_selected:
+                confined_data = build_confined_space_payload(
+                    st.session_state,
+                    {
+                        "manager_name": (
+                            selected_manager.get("name") if selected_manager else ""
+                        ),
+                        "team_leader_name": (
+                            selected_manager.get("team_leader_name", "")
+                            if selected_manager
+                            else ""
+                        ),
+                        "team_leader_department": (
+                            selected_manager.get("team_leader_department", "")
+                            if selected_manager
+                            else ""
+                        ),
+                        "worker_position": worker_position,
+                        "worker_name": worker_name,
+                    },
+                )
 
             validation_errors = []
             if selected_manager is None:
@@ -1211,6 +1828,21 @@ if page == "👷 현장 작업자":
                 validation_errors.append(
                     "안전조치 요구사항의 필수 항목을 체크해 주세요: "
                     + ", ".join(sorted(missing_required_checks))
+                )
+            if confined_data is not None and not start_error and not end_error:
+                validation_errors.extend(
+                    validate_confined_space_payload(
+                        confined_data,
+                        normalized_start,
+                        normalized_end,
+                        {
+                            "company_name": company_name,
+                            "worker_position": worker_position,
+                            "worker_name": worker_name,
+                            "work_location": work_location,
+                            "work_description": work_description,
+                        },
+                    )
                 )
 
             if validation_errors:
@@ -1271,34 +1903,16 @@ if page == "👷 현장 작업자":
                         if value:
                             form_data['safety_text_fields'][field] = str(value)
             
-            # 밀폐공간 (밀폐작업일 때만 저장)
-            if is_confined_space_work:
-                form_data['safety_checks']['밀폐공간'] = {
-                    '해당': st.session_state.get("check_밀폐공간_해당", False),
-                    '통신수단': st.session_state.get("check_밀폐공간_통신수단", False),
-                    '구명장구(줄, 송기마스크)': st.session_state.get("check_밀폐공간_구명장구(줄, 송기마스크)", False),
-                }
+            # 밀폐작업이면 별도 허가서 데이터를 저장하고, 중복되는 안전작업허가서
+            # 체크/가스측정 값은 같은 입력에서 자동으로 만든다.
+            if is_confined_space_selected:
+                form_data["confined_space"] = confined_data
+                confined_checks, shared_gas_measurements = (
+                    confined_payload_to_safety_fields(confined_data)
+                )
+                form_data['safety_checks']['밀폐공간'] = confined_checks
                 form_data['safety_text_fields']['밀폐공간 허가기간'] = str(work_date)
-
-                if confined_space_applies:
-                    for measurement_index in range(1, 5):
-                        measurement_time = st.session_state.get(
-                            f"gas_{measurement_index}_measurement_time"
-                        )
-                        form_data['gas_measurements'].append({
-                            'material_name': st.session_state.get(
-                                f"gas_{measurement_index}_material_name", ""
-                            ).strip(),
-                            'result': st.session_state.get(
-                                f"gas_{measurement_index}_result", ""
-                            ).strip(),
-                            'measurement_time': (
-                                measurement_time.strftime('%H:%M') if measurement_time else ""
-                            ),
-                            'measurer_confirmer': st.session_state.get(
-                                f"gas_{measurement_index}_measurer_confirmer", ""
-                            ).strip(),
-                        })
+                form_data['gas_measurements'] = shared_gas_measurements
             
             # 정전 (전기작업일 때만 저장)
             if is_power_outage_work:
@@ -1390,10 +2004,13 @@ if page == "👷 현장 작업자":
         for check in checks:
             if st.session_state.get(f"check_{category}_{check}", False):
                 checked_items.append(f"{category}: {check}")
-    if is_confined_space_work:
-        for check in ["해당", "통신수단", "구명장구(줄, 송기마스크)"]:
-            if st.session_state.get(f"check_밀폐공간_{check}", False):
-                checked_items.append(f"밀폐공간: {check}")
+    if is_confined_space_selected:
+        for item_index, item in enumerate(CONFINED_SPACE_SAFETY_ITEMS, start=1):
+            result = st.session_state.get(
+                f"confined_safety_{item_index}", "선택 안 함"
+            )
+            if result != "선택 안 함":
+                checked_items.append(f"밀폐공간: {item} ({result})")
     if is_power_outage_work:
         for check in ["해당", "스위치/차단기 내림", "잠금장치 시건, 표지부착"]:
             if st.session_state.get(f"check_정전_{check}", False):
@@ -1416,8 +2033,11 @@ if page == "👷 현장 작업자":
                 value = st.session_state.get(f"text_{category}_{field}", "")
                 if value:
                     filled_text_fields.append(f"{field}: {value}")
-    if is_confined_space_work:
+    if is_confined_space_selected:
         filled_text_fields.append(f"밀폐공간 허가기간: {work_date}")
+        internal_contact = st.session_state.get("confined_internal_contact", "")
+        if internal_contact:
+            filled_text_fields.append(f"밀폐공간 내부 연락방법: {internal_contact}")
     if is_power_outage_work:
         filled_text_fields.append(f"정전 허가기간: {work_date}")
         for field in ["전원복구 요청자", "전원복구 시간"]:
@@ -1432,20 +2052,23 @@ if page == "👷 현장 작업자":
         for item in filled_text_fields:
             st.markdown(f"- {item}")
 
-    if is_confined_space_work and confined_space_applies:
+    if is_confined_space_selected:
         gas_measurement_summary = []
-        for measurement_index in range(1, 5):
+        for measurement_index in range(1, 6):
             measurement_time = st.session_state.get(f"gas_{measurement_index}_measurement_time")
             measurement = {
                 "구분": f"측정 {measurement_index}",
                 "물질명": st.session_state.get(f"gas_{measurement_index}_material_name", ""),
-                "결과": st.session_state.get(f"gas_{measurement_index}_result", ""),
+                "측정농도": st.session_state.get(f"gas_{measurement_index}_concentration", ""),
                 "측정시간": measurement_time.strftime('%H:%M') if measurement_time else "",
-                "측정자/확인자": st.session_state.get(
-                    f"gas_{measurement_index}_measurer_confirmer", ""
+                "측정자 성명": st.session_state.get(
+                    f"gas_{measurement_index}_measurer_name", ""
                 ),
             }
-            if any(measurement[field] for field in ["물질명", "결과", "측정시간", "측정자/확인자"]):
+            if any(
+                measurement[field]
+                for field in ["물질명", "측정농도", "측정시간", "측정자 성명"]
+            ):
                 gas_measurement_summary.append(measurement)
 
         if gas_measurement_summary:
@@ -1501,6 +2124,9 @@ else:
                     new_manager_team_leader_name = st.text_input(
                         "팀장명", key="new_manager_team_leader_name"
                     )
+                    new_manager_team_leader_department = st.text_input(
+                        "팀장 부서", key="new_manager_team_leader_department"
+                    )
                     create_manager_submitted = st.form_submit_button(
                         "관리자 등록", use_container_width=True, type="primary"
                     )
@@ -1510,6 +2136,7 @@ else:
                             new_manager_name,
                             new_manager_email,
                             new_manager_team_leader_name,
+                            new_manager_team_leader_department,
                         )
                         st.success("관리자를 등록했습니다.")
                     except ValueError as e:
@@ -1525,7 +2152,7 @@ else:
                 for manager in admin_managers:
                     with st.expander(f"{manager['name']} · {manager['email']}"):
                         with st.form(f"manager_edit_form_{manager['id']}"):
-                            edit_col1, edit_col2, edit_col3 = st.columns(3)
+                            edit_col1, edit_col2, edit_col3, edit_col4 = st.columns(4)
                             with edit_col1:
                                 edited_name = st.text_input(
                                     "이름",
@@ -1543,6 +2170,17 @@ else:
                                     "팀장명",
                                     value=manager.get('team_leader_name', ''),
                                     key=f"manager_team_leader_name_{manager['id']}",
+                                )
+                            with edit_col4:
+                                edited_team_leader_department = st.text_input(
+                                    "팀장 부서",
+                                    value=manager.get(
+                                        'team_leader_department', ''
+                                    ),
+                                    key=(
+                                        "manager_team_leader_department_"
+                                        f"{manager['id']}"
+                                    ),
                                 )
                             confirm_delete_manager = st.checkbox(
                                 "이 관리자를 삭제하려면 체크",
@@ -1565,6 +2203,7 @@ else:
                                     edited_name,
                                     edited_email,
                                     edited_team_leader_name,
+                                    edited_team_leader_department,
                                 )
                                 st.success("관리자 정보를 수정했습니다.")
                             except ValueError as e:
@@ -1709,6 +2348,13 @@ else:
                                 if selected_admin_manager
                                 else None
                             ),
+                            'team_leader_department': (
+                                selected_admin_manager.get(
+                                    'team_leader_department', ''
+                                )
+                                if selected_admin_manager
+                                else None
+                            ),
                         }
                         with st.spinner("담당자 저장 중..."):
                             manager_saved = update_form_fields(
@@ -1787,14 +2433,38 @@ else:
                         }
                         for index, measurement in gas_measurements
                     ]))
+
+                confined_space_data = form.get("confined_space") or {}
+                if is_confined_space_work(form) and confined_space_data:
+                    st.markdown("**밀폐공간작업 허가서 추가 정보:**")
+                    if confined_space_data.get("internal_contact"):
+                        st.markdown(
+                            f"- 내부 연락방법: {confined_space_data['internal_contact']}"
+                        )
+                    confined_results = [
+                        {"확인항목": item, "확인결과": result}
+                        for item, result in (
+                            confined_space_data.get("safety_results") or {}
+                        ).items()
+                        if result and result != "선택 안 함"
+                    ]
+                    if confined_results:
+                        st.table(pd.DataFrame(confined_results))
+                    if confined_space_data.get("special_actions"):
+                        st.markdown(
+                            "- 특별조치 필요사항: "
+                            f"{confined_space_data['special_actions']}"
+                        )
                 
                 if form['special_notes']:
                     st.markdown(f"**특별사항:** {form['special_notes']}")
                 
                 # Action buttons for each form
-                col1, col2 = st.columns(2)
+                action_columns = st.columns(
+                    3 if is_confined_space_work(form) else 2
+                )
                 
-                with col1:
+                with action_columns[0]:
                     if st.button(f"📥 Excel 다운로드", key=f"download_{form_key}", use_container_width=True):
                         excel_data = fill_excel_template(form)
                         if excel_data:
@@ -1806,8 +2476,33 @@ else:
                             )
                         else:
                             st.error("❌ Excel 템플릿을 찾을 수 없습니다.")
-                
-                with col2:
+
+                if is_confined_space_work(form):
+                    with action_columns[1]:
+                        if st.button(
+                            "📥 밀폐공간 허가서",
+                            key=f"confined_download_{form_key}",
+                            use_container_width=True,
+                        ):
+                            confined_excel_data = fill_confined_space_template(form)
+                            if confined_excel_data:
+                                st.download_button(
+                                    label="💾 밀폐공간 허가서 저장",
+                                    data=confined_excel_data,
+                                    file_name=(
+                                        "밀폐공간작업_작업허가서_"
+                                        f"{form['id']}.xlsx"
+                                    ),
+                                    mime=(
+                                        "application/vnd.openxmlformats-officedocument."
+                                        "spreadsheetml.sheet"
+                                    ),
+                                    key=f"confined_file_{form_key}",
+                                )
+                            else:
+                                st.error("❌ 밀폐공간작업 Excel 템플릿을 찾을 수 없습니다.")
+
+                with action_columns[-1]:
                     if st.button(f"🖨️ 인쇄", key=f"print_{form_key}", use_container_width=True):
                         st.info("📄 Excel 다운로드 후 인쇄하세요.")
                 
