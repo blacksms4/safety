@@ -249,35 +249,35 @@ def build_confined_space_cell_mapping(form_data):
         supervisors[0]["position"] = "관리감독자"
     supervisors = supervisors[:1]
 
+    manager_name = str(form_data.get("manager_name") or "").strip()
+
     watchers = [
         dict(person)
         for person in (confined_data.get("watchers") or [])
         if isinstance(person, dict)
     ]
-    current_manager_name = str(form_data.get("manager_name") or "").strip()
-    if current_manager_name:
-        if watchers:
-            watchers[0].update(
-                {"position": "감시인", "name": current_manager_name}
-            )
-        else:
-            watchers.append(
-                {"position": "감시인", "name": current_manager_name}
-            )
     if watchers:
         watchers[0]["position"] = "감시인"
     watchers = watchers[:1]
 
-    person_groups = [
-        (35, supervisors),
-        (36, watchers),
+    role_people = [
+        {
+            "position": "관리감독자",
+            "name": str(supervisors[0].get("name") or "") if supervisors else "",
+        },
+        {"position": "담당자", "name": manager_name},
+        {
+            "position": "감시인",
+            "name": str(watchers[0].get("name") or "") if watchers else "",
+        },
     ]
+    person_groups = [(35, role_people)]
     workers = [
         {**person, "position": "작업자"}
         for person in (confined_data.get("workers") or [])
         if isinstance(person, dict)
     ]
-    person_groups.extend([(37, workers[:3]), (38, workers[3:6])])
+    person_groups.extend([(36, workers[:3]), (37, workers[3:6])])
     position_cells = ["A", "C", "E"]
     name_cells = ["B", "D", "F"]
     for row_number, people in person_groups:
@@ -325,25 +325,28 @@ def build_confined_space_payload(session_values, shared_data):
         measurement_time = session_values.get(f"gas_{index}_measurement_time")
         if hasattr(measurement_time, "strftime"):
             measurement_time = measurement_time.strftime("%H:%M")
-        gas_measurements.append(
-            {
-                "material_name": str(
-                    session_values.get(f"gas_{index}_material_name")
-                    or ""
-                ).strip(),
-                "concentration": str(
-                    session_values.get(f"gas_{index}_concentration")
-                    or ""
-                ).strip(),
-                "measurement_time": str(measurement_time or "").strip(),
-                "measurer_name": str(
-                    session_values.get(f"gas_{index}_measurer_name")
-                    or ""
-                ).strip(),
-            }
+        normalized_time, measurement_time_error = normalize_clock_time(
+            measurement_time
         )
+        measurement = {
+            "material_name": str(
+                session_values.get(f"gas_{index}_material_name")
+                or ""
+            ).strip(),
+            "concentration": str(
+                session_values.get(f"gas_{index}_concentration")
+                or ""
+            ).strip(),
+            "measurement_time": normalized_time,
+            "measurer_name": str(
+                session_values.get(f"gas_{index}_measurer_name")
+                or ""
+            ).strip(),
+        }
+        if measurement_time_error:
+            measurement["measurement_time_error"] = measurement_time_error
+        gas_measurements.append(measurement)
 
-    manager_name = str(shared_data.get("manager_name") or "").strip()
     team_leader_name = str(
         shared_data.get("team_leader_name") or ""
     ).strip()
@@ -353,10 +356,13 @@ def build_confined_space_payload(session_values, shared_data):
             {"position": "관리감독자", "name": team_leader_name}
         )
 
+    watcher_name = str(
+        session_values.get("confined_watcher_name") or ""
+    ).strip()
     watchers = []
-    if manager_name:
+    if watcher_name:
         watchers.append(
-            {"position": "감시인", "name": manager_name}
+            {"position": "감시인", "name": watcher_name}
         )
 
     workers = []
@@ -446,9 +452,18 @@ def validate_confined_space_payload(
 
     complete_measurements = 0
     has_partial_measurement = False
-    for measurement in confined_data.get("gas_measurements") or []:
+    for measurement_index, measurement in enumerate(
+        confined_data.get("gas_measurements") or [], start=1
+    ):
         if not isinstance(measurement, dict):
             continue
+        measurement_time_error = str(
+            measurement.get("measurement_time_error") or ""
+        ).strip()
+        if measurement_time_error:
+            errors.append(
+                f"가스측정 {measurement_index} 시간: {measurement_time_error}"
+            )
         values = [
             str(measurement.get(field) or "").strip()
             for field in (
@@ -1220,9 +1235,9 @@ def fill_confined_space_template(form_data):
                     "width": 50,
                 },
                 {
-                    "cell": "B37",
+                    "cell": "B36",
                     "column": 1,
-                    "row": 36,
+                    "row": 35,
                     "offset": 50,
                     "width": 50,
                 },
@@ -1652,11 +1667,31 @@ if page == "👷 현장 작업자":
                     placeholder="예: 20.9%, 0ppm",
                 )
             with gas_col3:
-                st.time_input(
-                    "측정시간",
-                    value=None,
-                    key=f"gas_{measurement_index}_measurement_time",
+                measurement_time_key = (
+                    f"gas_{measurement_index}_measurement_time"
                 )
+                existing_measurement_time = st.session_state.get(
+                    measurement_time_key
+                )
+                if hasattr(existing_measurement_time, "strftime"):
+                    st.session_state[measurement_time_key] = (
+                        existing_measurement_time.strftime("%H:%M")
+                    )
+                elif existing_measurement_time is None:
+                    st.session_state.pop(measurement_time_key, None)
+                st.text_input(
+                    "측정시간",
+                    key=measurement_time_key,
+                    placeholder="예: 08:10 또는 0810",
+                    max_chars=5,
+                    on_change=normalize_time_widget,
+                    args=(measurement_time_key,),
+                )
+                measurement_time_error = st.session_state.get(
+                    f"{measurement_time_key}_error"
+                )
+                if measurement_time_error:
+                    st.caption(f"⚠️ {measurement_time_error}")
             with gas_col4:
                 st.text_input(
                     "측정자 성명",
@@ -1686,13 +1721,18 @@ if page == "👷 현장 작업자":
                 else ""
             )
             st.caption(
-                "관리감독자와 최종 승인자는 승인자(팀장), 감시인은 담당 관리자로 "
-                "자동 입력됩니다. 신청인은 첫 번째 작업자로 자동 입력됩니다."
+                "관리감독자와 최종 승인자는 승인자(팀장), 담당자는 선택한 담당 "
+                "관리자로 자동 입력됩니다. 신청인은 첫 번째 작업자로 자동 입력됩니다."
             )
             st.info(
                 f"관리감독자·최종 승인자: {auto_team_leader_name or '미등록'} "
                 f"({auto_team_leader_department or '부서 미등록'})\n\n"
-                f"감시인: 담당 관리자 {auto_manager_name or '미선택'}"
+                f"담당자: {auto_manager_name or '미선택'}"
+            )
+            st.text_input(
+                "감시인 이름",
+                key="confined_watcher_name",
+                placeholder="밀폐공간 감시인 이름 입력",
             )
 
             st.markdown("**추가 작업자**")
@@ -2060,7 +2100,7 @@ if page == "👷 현장 작업자":
                 "구분": f"측정 {measurement_index}",
                 "물질명": st.session_state.get(f"gas_{measurement_index}_material_name", ""),
                 "측정농도": st.session_state.get(f"gas_{measurement_index}_concentration", ""),
-                "측정시간": measurement_time.strftime('%H:%M') if measurement_time else "",
+                "측정시간": format_time_value(measurement_time),
                 "측정자 성명": st.session_state.get(
                     f"gas_{measurement_index}_measurer_name", ""
                 ),
@@ -2505,43 +2545,3 @@ else:
                 with action_columns[-1]:
                     if st.button(f"🖨️ 인쇄", key=f"print_{form_key}", use_container_width=True):
                         st.info("📄 Excel 다운로드 후 인쇄하세요.")
-                
-        # Bulk actions
-        st.markdown("---")
-        st.markdown("### Firebase 저장 기록 관리")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("Firebase 저장 기록 전체 삭제", use_container_width=True):
-                st.session_state.confirm_delete_all_forms = True
-
-            if st.session_state.get('confirm_delete_all_forms'):
-                st.warning("정말 Firebase에 저장된 모든 허가서 기록을 삭제할까요? 이 작업은 되돌릴 수 없습니다.")
-                confirm_col, cancel_col = st.columns(2)
-                with confirm_col:
-                    if st.button("삭제 확정", key="confirm_delete_all_forms_button", use_container_width=True, type="primary"):
-                        with st.spinner("Firebase 저장 기록 삭제 중..."):
-                            deleted_count = delete_all_forms()
-                        if deleted_count is not None:
-                            st.session_state.confirm_delete_all_forms = False
-                            st.success(f"{deleted_count}건이 삭제되었습니다.")
-                            st.rerun()
-                with cancel_col:
-                    if st.button("취소", key="cancel_delete_all_forms_button", use_container_width=True):
-                        st.session_state.confirm_delete_all_forms = False
-                        st.rerun()
-        
-        with col2:
-            if st.button("📊 통계 보기", use_container_width=True):
-                st.markdown("### 📊 제출 통계")
-                work_types = [f['work_type'] for f in forms]
-                type_counts = pd.Series(work_types).value_counts()
-                st.bar_chart(type_counts)
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666; font-size: 0.8rem;'>
-    안전작업허가서 시스템 | 모바일 친화적 설계
-</div>
-""", unsafe_allow_html=True)
