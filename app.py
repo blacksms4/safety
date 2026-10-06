@@ -838,6 +838,7 @@ def validate_confined_space_payload(
     ):
         if not isinstance(measurement, dict):
             continue
+        has_optional_phase_value = False
         measurement_time_error = str(
             measurement.get("measurement_time_error") or ""
         ).strip()
@@ -863,6 +864,9 @@ def validate_confined_space_payload(
             phase_concentration = str(
                 measurement.get(f"{phase_key}_concentration") or ""
             ).strip()
+            has_optional_phase_value = (
+                has_optional_phase_value or bool(phase_time or phase_concentration)
+            )
             if bool(phase_time) != bool(phase_concentration):
                 errors.append(
                     f"가스측정 {measurement_index} {phase_label} 시간과 농도를 "
@@ -877,6 +881,8 @@ def validate_confined_space_payload(
                 "measurer_name",
             )
         ]
+        if not any(values[1:]) and not has_optional_phase_value:
+            continue
         filled_count = sum(bool(value) for value in values)
         if filled_count == len(values):
             complete_measurements += 1
@@ -2077,7 +2083,8 @@ if page == "👷 현장 작업자":
 
         with before_gas_tab:
             st.caption(
-                "한 행 이상 물질명·측정시간·농도·측정자 성명을 모두 입력하세요."
+                "기본 표시된 4종을 모두 입력할 필요는 없습니다. 실제 측정한 "
+                "항목 1건 이상에 물질명·측정시간·농도·측정자 성명을 입력하세요."
             )
             for measurement_index in range(1, 6):
                 st.markdown(f"**가스 {measurement_index}**")
