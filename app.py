@@ -31,7 +31,7 @@ st.set_page_config(
 )
 
 # Data storage
-EXCEL_TEMPLATE = "안전작업허가서.xlsx"
+EXCEL_TEMPLATE = "신양식 안전작업허가서.xlsx"
 CONFINED_SPACE_TEMPLATE = os.path.join(
     "outputs", "confined_space_permit", "밀폐공간작업 작업 허가서.xlsx"
 )
@@ -83,6 +83,14 @@ SAFETY_CHECK_CATEGORY_NAMES = {
     '굴착',
     '고소',
     '중장비',
+    '화기작업',
+    '고소작업',
+    '정전작업',
+    '굴착작업',
+    '중량물취급작업',
+    '기타위험작업',
+    '밀폐공간작업',
+    '중장비작업',
 }
 
 
@@ -167,9 +175,294 @@ def is_confined_space_work(form_data):
         selected_work_types = [
             item.strip() for item in selected_work_types.split(",") if item.strip()
         ]
-    if "밀폐작업" in selected_work_types:
+    confined_labels = {"밀폐작업", "밀폐공간작업"}
+    if confined_labels.intersection(selected_work_types):
         return True
-    return "밀폐작업" in str(form_data.get("work_type") or "")
+    work_type_text = str(form_data.get("work_type") or "")
+    return any(label in work_type_text for label in confined_labels)
+
+
+def get_safety_work_catalog():
+    """Return the work-specific checklist printed on the new permit form."""
+    return {
+        "화기작업": [
+            "작업구역 내 가연성물질 방치 유무",
+            "불티비산방지막 및 소화기 등 비치유무",
+            "인화성가스 등 가스농도측정 유무",
+            "화재감시자 배치 유무",
+            "보호구(보안면·용접장갑·방염복) 착용 상태",
+        ],
+        "고소작업": [
+            "(사다리) 2인1조 작업 및 안전벨트 착용 유무",
+            "(고소작업대) 아웃트리거, 안전바 설치 유무",
+            "추락 방지조치 유무(추락방호망 등)",
+            "안전난간대 및 안전발판 등 설치 유무",
+            "보호구(안전모·안전대·안전화) 착용 상태",
+        ],
+        "정전작업": [
+            "주 전원 차단 유무",
+            "접지 및 방전 확인 유무",
+            "차단 표지판 부착 유무",
+            "잠금장치 시건 유무",
+            "보호구(절연장갑·절연화·안전모) 착용 상태",
+        ],
+        "굴착작업": [
+            "지하 매설물 확인(가스/소방/통신/케이블 등)",
+            "인접 지역 붕괴 예방조치",
+            "굴착장비 운전자 자격증 소지 여부 확인",
+            "안전난간대 및 안전발판 등 설치 유무",
+            "보호구(안전모·안전화·반사조끼) 착용 상태",
+        ],
+        "중량물취급작업": [
+            "근로자가 사전 안전 교육 실시여부",
+            "안전한 작업방법(자세·운반경로) 준수 여부",
+            "2인1조 작업을 하고 있는지",
+            "보호구(안전모·안전화·보호장갑) 착용 상태",
+        ],
+        "기타위험작업": [
+            "작업계획서 및 위험성평가 실시 유무",
+            "취급물질 MSDS 및 관련 자격 확인 유무",
+            "출입통제 및 감시인 배치 유무",
+            "보호구(보안경·보호복·선량계 등) 착용 상태",
+        ],
+        "밀폐공간작업": [
+            "산소측정기, 통신장비, 구명장비 등 비치 유무",
+            "환기 및 배기장치 비치 유무",
+            "상시 감시인 배치 유무",
+            "가스농도측정 유무",
+            "출입인원 점검 및 출입금지 표지 부착 유무",
+            "보호구(송기마스크·안전대·구명줄) 착용 상태",
+        ],
+        "중장비작업": [
+            "중장비 자격증 소지 여부",
+            "중장비 안전장치 정상 유무",
+            "기상 및 노면 상태 적정 유무",
+            "주변 장애물 및 전선, 설비 간섭 여부",
+            "신호수 등 배치 유무",
+            "보호구 착용 및 운전석 안전벨트 체결 상태",
+        ],
+    }
+
+
+def validate_selected_safety_checks(selected_work_types, safety_checks):
+    """Require one of 확인/해당없음 for every item of selected work."""
+    catalog = get_safety_work_catalog()
+    aliases = {
+        "용접작업": "화기작업",
+        "전기작업": "정전작업",
+        "밀폐작업": "밀폐공간작업",
+        "기타": "기타위험작업",
+    }
+    normalized_types = [aliases.get(item, item) for item in selected_work_types or []]
+    errors = []
+    for work_type in normalized_types:
+        items = catalog.get(work_type, [])
+        results = safety_checks.get(work_type, {}) if safety_checks else {}
+        completed = sum(
+            str(results.get(item) or "").strip() in {"확인", "해당없음", "해당 없음"}
+            for item in items
+        )
+        if items and completed != len(items):
+            errors.append(
+                f"{work_type} 안전조치 {len(items)}개 항목을 모두 선택해 주세요."
+            )
+    return errors
+
+
+def build_safety_permit_cell_mapping(form_data):
+    """Map one submission to the 15-column new safety-work-permit form."""
+    catalog = get_safety_work_catalog()
+    aliases = {
+        "용접작업": "화기작업",
+        "전기작업": "정전작업",
+        "밀폐작업": "밀폐공간작업",
+        "기타": "기타위험작업",
+    }
+    selected_work_types = form_data.get("work_types") or []
+    if isinstance(selected_work_types, str):
+        selected_work_types = [
+            item.strip() for item in selected_work_types.split(",") if item.strip()
+        ]
+    if not selected_work_types:
+        work_type_text = str(form_data.get("work_type") or "")
+        selected_work_types = [
+            label for label in [*catalog, *aliases] if label in work_type_text
+        ]
+    selected_work_types = {aliases.get(item, item) for item in selected_work_types}
+
+    work_date_text = str(form_data.get("work_date") or "")
+    try:
+        work_date = datetime.strptime(work_date_text, "%Y-%m-%d")
+        date_text = f"{work_date.year}년 {work_date.month}월 {work_date.day}일"
+    except ValueError:
+        date_text = work_date_text
+    start_time = str(form_data.get("permit_start_time") or "")
+    end_time = str(form_data.get("permit_end_time") or "")
+    time_text = f" ({start_time} ~ {end_time})" if start_time or end_time else ""
+
+    worker_name = str(form_data.get("worker_name") or "").strip()
+    worker_position = str(form_data.get("worker_position") or "").strip()
+    worker_phone = str(form_data.get("worker_phone") or "").strip()
+    responsible_parts = [part for part in (worker_position, worker_name) if part]
+    responsible_text = " ".join(responsible_parts)
+    if responsible_text:
+        responsible_text += "   (서명)"
+    responsible_text += f"   (TEL : {worker_phone})"
+
+    worker_count = form_data.get("worker_count")
+    try:
+        worker_count_text = f"총 {int(worker_count)}명" if int(worker_count) > 0 else ""
+    except (TypeError, ValueError):
+        worker_count_text = str(worker_count or "")
+
+    materials = set(form_data.get("additional_materials") or [])
+    other_material = str(form_data.get("other_material") or "").strip()
+    mapping = {
+        "C2": str(form_data.get("company_name") or ""),
+        "K2": responsible_text,
+        "C3": f"{date_text}{time_text}".strip(),
+        "C4": str(form_data.get("work_description") or ""),
+        "C5": str(form_data.get("work_location") or ""),
+        "K5": worker_count_text,
+        "C6": f"{'☑' if '위험성평가' in materials else '□'} 위험성평가",
+        "F6": f"{'☑' if '작업계획서' in materials else '□'} 작업계획서",
+        "L6": (
+            f"{'☑' if '기타 자료' in materials else '□'} "
+            f"기타 자료({other_material})"
+        ),
+        "B38": str(form_data.get("special_notes") or ""),
+    }
+
+    work_type_labels = [
+        ("화기작업", "화기작업"),
+        ("고소작업", "고소작업"),
+        ("정전작업", "정전작업"),
+        ("굴착작업", "굴착작업"),
+        ("중량물취급작업", "중량물취급작업"),
+        ("밀폐공간작업", "밀폐공간작업"),
+        ("중장비작업", "중장비작업"),
+        ("기타위험작업", "기타위험작업(화학설비 취급, 방사선 작업 등)"),
+    ]
+    marked_labels = [
+        f"{'☑' if key in selected_work_types else '□'} {label}"
+        for key, label in work_type_labels
+    ]
+    mapping["C7"] = "   ".join(marked_labels[:5]) + "\n" + "   ".join(
+        marked_labels[5:]
+    )
+
+    section_layout = {
+        "화기작업": ("A8", "화기작업 (용접시 용접봉 MSDS 현장 비치)", 9, "E", "G"),
+        "고소작업": ("I8", "고소작업", 9, "N", "O"),
+        "정전작업": ("A14", "정전작업", 15, "E", "G"),
+        "굴착작업": ("I14", "굴착작업", 15, "N", "O"),
+        "중량물취급작업": ("A20", "중량물취급작업", 21, "E", "G"),
+        "기타위험작업": ("I20", "기타위험작업 (화학설비·방사선 등)", 21, "N", "O"),
+        "밀폐공간작업": ("A25", "밀폐공간작업", 26, "E", "G"),
+        "중장비작업": ("I25", "중장비작업", 26, "N", "O"),
+    }
+    safety_checks = form_data.get("safety_checks") or {}
+    for work_type, items in catalog.items():
+        header_cell, header_label, start_row, confirm_col, none_col = section_layout[
+            work_type
+        ]
+        mark = "☑" if work_type in selected_work_types else "□"
+        mapping[header_cell] = f"{mark} {header_label}"
+        results = safety_checks.get(work_type, {})
+        for row_number, item in enumerate(items, start=start_row):
+            mapping[f"{confirm_col}{row_number}"] = "□"
+            mapping[f"{none_col}{row_number}"] = "□"
+            raw_result = results.get(item)
+            if raw_result is True:
+                result = "확인"
+            else:
+                result = str(raw_result or "").strip().replace("해당 없음", "해당없음")
+                if result == "적합":
+                    result = "확인"
+            if result == "확인":
+                mapping[f"{confirm_col}{row_number}"] = "☑"
+            elif result == "해당없음":
+                mapping[f"{none_col}{row_number}"] = "☑"
+
+    gas_rows = {
+        "CO2": 33,
+        "이산화탄소": 33,
+        "O2": 34,
+        "산소": 34,
+        "CO": 35,
+        "일산화탄소": 35,
+        "H2S": 36,
+        "황화수소": 36,
+    }
+    for measurement in form_data.get("gas_measurements") or []:
+        if not isinstance(measurement, dict):
+            continue
+        material = str(measurement.get("material_name") or "").upper().replace(" ", "")
+        row_number = next(
+            (row for key, row in gas_rows.items() if key.upper() in material), None
+        )
+        if not row_number:
+            continue
+        mapping[f"E{row_number}"] = str(measurement.get("measurement_time") or "")
+        mapping[f"F{row_number}"] = str(
+            measurement.get("result") or measurement.get("concentration") or ""
+        )
+        mapping[f"G{row_number}"] = str(
+            measurement.get("during_measurement_time") or ""
+        )
+        mapping[f"H{row_number}"] = str(
+            measurement.get("during_concentration") or ""
+        )
+        mapping[f"I{row_number}"] = str(
+            measurement.get("after_measurement_time") or ""
+        )
+        mapping[f"J{row_number}"] = str(
+            measurement.get("after_concentration") or ""
+        )
+        mapping[f"K{row_number}"] = str(
+            measurement.get("measurer_name")
+            or measurement.get("measurer_confirmer")
+            or ""
+        )
+        mapping[f"M{row_number}"] = str(
+            measurement.get("confirmer_name") or ""
+        )
+        mapping[f"O{row_number}"] = str(measurement.get("note") or "")
+
+    manager_name = str(form_data.get("manager_name") or "").strip()
+    approver_name = str(
+        form_data.get("approver_name") or form_data.get("team_leader_name") or ""
+    ).strip()
+    approver_department = str(form_data.get("team_leader_department") or "").strip()
+    if manager_name:
+        mapping["C40"] = f"성명 {manager_name}   (서명)"
+    if approver_name or approver_department:
+        mapping["C42"] = (
+            f"부서 {approver_department}   직책 팀장   "
+            f"성명 {approver_name}   (서명)"
+        )
+
+    collaborator_rows = (
+        ("manager_collaborator", "K40"),
+        ("approver_collaborator", "K42"),
+    )
+    for prefix, cell in collaborator_rows:
+        department = str(form_data.get(f"{prefix}_department") or "").strip()
+        position = str(form_data.get(f"{prefix}_position") or "").strip()
+        name = str(form_data.get(f"{prefix}_name") or "").strip()
+        if department or position or name:
+            mapping[cell] = (
+                f"부서 {department}   직책 {position}   "
+                f"성명 {name}   (서명)"
+            )
+    if form_data.get("extend_requested"):
+        mapping["B43"] = (
+            f"{form_data.get('extend_date') or ''} "
+            f"{form_data.get('extend_start') or ''} ~ "
+            f"{form_data.get('extend_end') or ''}   "
+            f"승인자 {approver_name}   (서명)"
+        )
+    return mapping
 
 
 def build_confined_space_cell_mapping(form_data):
@@ -221,8 +514,30 @@ def build_confined_space_cell_mapping(form_data):
         if not isinstance(measurement, dict):
             continue
         mapping[f"A{row_number}"] = str(measurement.get("material_name") or "")
-        mapping[f"B{row_number}"] = str(measurement.get("concentration") or "")
-        mapping[f"C{row_number}"] = str(measurement.get("measurement_time") or "")
+        before_concentration = str(measurement.get("concentration") or "")
+        before_time = str(measurement.get("measurement_time") or "")
+        during_concentration = str(
+            measurement.get("during_concentration") or ""
+        )
+        during_time = str(measurement.get("during_measurement_time") or "")
+        after_concentration = str(
+            measurement.get("after_concentration") or ""
+        )
+        after_time = str(measurement.get("after_measurement_time") or "")
+        if during_concentration or during_time or after_concentration or after_time:
+            concentration_parts = [f"전 {before_concentration}".rstrip()]
+            time_parts = [f"전 {before_time}".rstrip()]
+            if during_concentration or during_time:
+                concentration_parts.append(f"중 {during_concentration}".rstrip())
+                time_parts.append(f"중 {during_time}".rstrip())
+            if after_concentration or after_time:
+                concentration_parts.append(f"후 {after_concentration}".rstrip())
+                time_parts.append(f"후 {after_time}".rstrip())
+            mapping[f"B{row_number}"] = " / ".join(concentration_parts)
+            mapping[f"C{row_number}"] = " / ".join(time_parts)
+        else:
+            mapping[f"B{row_number}"] = before_concentration
+            mapping[f"C{row_number}"] = before_time
         mapping[f"D{row_number}"] = str(measurement.get("measurer_name") or "")
 
     supervisors = [
@@ -322,12 +637,17 @@ def build_confined_space_payload(session_values, shared_data):
 
     gas_measurements = []
     for index in range(1, 6):
-        measurement_time = session_values.get(f"gas_{index}_measurement_time")
-        if hasattr(measurement_time, "strftime"):
-            measurement_time = measurement_time.strftime("%H:%M")
-        normalized_time, measurement_time_error = normalize_clock_time(
-            measurement_time
-        )
+        phase_times = {}
+        phase_time_errors = {}
+        for phase in ("", "during_", "after_"):
+            phase_time = session_values.get(
+                f"gas_{index}_{phase}measurement_time"
+            )
+            if hasattr(phase_time, "strftime"):
+                phase_time = phase_time.strftime("%H:%M")
+            normalized_time, time_error = normalize_clock_time(phase_time)
+            phase_times[phase] = normalized_time
+            phase_time_errors[phase] = time_error
         measurement = {
             "material_name": str(
                 session_values.get(f"gas_{index}_material_name")
@@ -337,14 +657,33 @@ def build_confined_space_payload(session_values, shared_data):
                 session_values.get(f"gas_{index}_concentration")
                 or ""
             ).strip(),
-            "measurement_time": normalized_time,
+            "measurement_time": phase_times[""],
+            "during_concentration": str(
+                session_values.get(f"gas_{index}_during_concentration")
+                or ""
+            ).strip(),
+            "during_measurement_time": phase_times["during_"],
+            "after_concentration": str(
+                session_values.get(f"gas_{index}_after_concentration")
+                or ""
+            ).strip(),
+            "after_measurement_time": phase_times["after_"],
             "measurer_name": str(
                 session_values.get(f"gas_{index}_measurer_name")
                 or ""
             ).strip(),
+            "confirmer_name": str(
+                session_values.get(f"gas_{index}_confirmer_name")
+                or ""
+            ).strip(),
         }
-        if measurement_time_error:
-            measurement["measurement_time_error"] = measurement_time_error
+        for phase, error_key in (
+            ("", "measurement_time_error"),
+            ("during_", "during_measurement_time_error"),
+            ("after_", "after_measurement_time_error"),
+        ):
+            if phase_time_errors[phase]:
+                measurement[error_key] = phase_time_errors[phase]
         gas_measurements.append(measurement)
 
     team_leader_name = str(
@@ -405,11 +744,37 @@ def build_confined_space_payload(session_values, shared_data):
 def confined_payload_to_safety_fields(confined_data):
     """Reuse confined permit inputs in the matching safety-permit fields."""
     safety_results = confined_data.get("safety_results") or {}
+
+    def combined_result(*source_items):
+        results = [
+            str(safety_results.get(item) or "선택 안 함").strip()
+            for item in source_items
+        ]
+        if any(result == "적합" for result in results):
+            return "확인"
+        if results and all(result == "해당 없음" for result in results):
+            return "해당없음"
+        return "선택 안 함"
+
     safety_checks = {
-        "해당": True,
-        "통신수단": safety_results.get("전화 및 무선기기 구비") == "적합",
-        "구명장구(줄, 송기마스크)": (
-            safety_results.get("공기호흡기 또는 송기마스크 비치") == "적합"
+        "산소측정기, 통신장비, 구명장비 등 비치 유무": combined_result(
+            "전화 및 무선기기 구비",
+            "공기호흡기 또는 송기마스크 비치",
+            "필요한 안전장구 구비",
+        ),
+        "환기 및 배기장치 비치 유무": combined_result(
+            "환기시설 설치 및 환기 실시여부"
+        ),
+        "상시 감시인 배치 유무": combined_result(
+            "관리감독자 지정 및 감시인 배치"
+        ),
+        "가스농도측정 유무": combined_result("산소 및 유해가스 측정"),
+        "출입인원 점검 및 출입금지 표지 부착 유무": combined_result(
+            "밀폐공간작업 관계자외 출입금지 표지판 게시"
+        ),
+        "보호구(송기마스크·안전대·구명줄) 착용 상태": combined_result(
+            "공기호흡기 또는 송기마스크 비치",
+            "필요한 안전장구 구비",
         ),
     }
     gas_measurements = []
@@ -423,9 +788,25 @@ def confined_payload_to_safety_fields(confined_data):
                 "measurement_time": str(
                     measurement.get("measurement_time") or ""
                 ),
-                "measurer_confirmer": str(
+                "during_concentration": str(
+                    measurement.get("during_concentration") or ""
+                ),
+                "during_measurement_time": str(
+                    measurement.get("during_measurement_time") or ""
+                ),
+                "after_concentration": str(
+                    measurement.get("after_concentration") or ""
+                ),
+                "after_measurement_time": str(
+                    measurement.get("after_measurement_time") or ""
+                ),
+                "measurer_name": str(
                     measurement.get("measurer_name") or ""
                 ),
+                "confirmer_name": str(
+                    measurement.get("confirmer_name") or ""
+                ),
+                "note": str(measurement.get("note") or ""),
             }
         )
     return safety_checks, gas_measurements
@@ -464,6 +845,29 @@ def validate_confined_space_payload(
             errors.append(
                 f"가스측정 {measurement_index} 시간: {measurement_time_error}"
             )
+        for phase_key, phase_label in (
+            ("during", "작업 중"),
+            ("after", "작업 후"),
+        ):
+            phase_time_error = str(
+                measurement.get(f"{phase_key}_measurement_time_error") or ""
+            ).strip()
+            if phase_time_error:
+                errors.append(
+                    f"가스측정 {measurement_index} {phase_label} 시간: "
+                    f"{phase_time_error}"
+                )
+            phase_time = str(
+                measurement.get(f"{phase_key}_measurement_time") or ""
+            ).strip()
+            phase_concentration = str(
+                measurement.get(f"{phase_key}_concentration") or ""
+            ).strip()
+            if bool(phase_time) != bool(phase_concentration):
+                errors.append(
+                    f"가스측정 {measurement_index} {phase_label} 시간과 농도를 "
+                    "모두 입력해 주세요."
+                )
         values = [
             str(measurement.get(field) or "").strip()
             for field in (
@@ -917,7 +1321,7 @@ WORK_TYPE_CHECKBOX_CELL_MAP = {
 }
 
 
-def fill_excel_template(form_data):
+def _fill_legacy_excel_template(form_data):
     if not os.path.exists(EXCEL_TEMPLATE):
         return None
 
@@ -1190,6 +1594,64 @@ def fill_excel_template(form_data):
     return output
 
 
+def fill_excel_template(form_data):
+    """Fill the new safety-work-permit Excel template."""
+    if not os.path.exists(EXCEL_TEMPLATE):
+        return None
+
+    form_data = decode_form_signatures(form_data)
+    workbook = load_workbook(EXCEL_TEMPLATE)
+    worksheet = workbook.active
+    for cell, value in build_safety_permit_cell_mapping(form_data).items():
+        if value is not None:
+            worksheet[cell] = value
+
+    signature_data = (form_data.get("signatures") or {}).get("company_rep")
+    if signature_data is not None and not isinstance(signature_data, str):
+        try:
+            import numpy as np
+            from openpyxl.drawing.spreadsheet_drawing import (
+                AnchorMarker,
+                OneCellAnchor,
+            )
+            from openpyxl.drawing.xdr import XDRPositiveSize2D
+            from openpyxl.utils.units import pixels_to_EMU
+
+            signature_array = np.asarray(signature_data).astype("uint8")
+            signature_image = PILImage.fromarray(signature_array).convert("RGBA")
+            signature_image.putdata(
+                [
+                    (255, 255, 255, 0)
+                    if pixel[0] > 200 and pixel[1] > 200 and pixel[2] > 200
+                    else pixel
+                    for pixel in signature_image.getdata()
+                ]
+            )
+            signature_image = signature_image.resize((55, 16))
+            image_bytes = io.BytesIO()
+            signature_image.save(image_bytes, format="PNG")
+            image = OpenpyxlImage(io.BytesIO(image_bytes.getvalue()))
+            image.anchor = OneCellAnchor(
+                _from=AnchorMarker(
+                    col=13,
+                    colOff=pixels_to_EMU(4),
+                    row=1,
+                    rowOff=pixels_to_EMU(5),
+                ),
+                ext=XDRPositiveSize2D(
+                    pixels_to_EMU(55), pixels_to_EMU(16)
+                ),
+            )
+            worksheet.add_image(image)
+        except Exception as error:
+            print(f"Error adding safety-permit signature: {error}")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
+
+
 def fill_confined_space_template(form_data):
     """Fill the separate confined-space Excel permit from one submission."""
     if not os.path.exists(CONFINED_SPACE_TEMPLATE):
@@ -1408,7 +1870,7 @@ if page == "👷 현장 작업자":
         work_target = st.text_input("작업대상", key="work_target")
         work_types = st.multiselect(
             "작업종류 (복수 선택 가능)",
-            ["굴착작업", "고소작업", "중장비작업", "전기작업", "용접작업", "밀폐작업", "기타"],
+            list(get_safety_work_catalog()),
             key="work_types",
             help="선택한 모든 작업 종류의 점검 항목이 아래에 표시됩니다.",
         )
@@ -1426,6 +1888,7 @@ if page == "👷 현장 작업자":
         company_name = st.text_input("업체명", key="company_name")
         worker_position = st.text_input("직책", key="worker_position")
         worker_name = st.text_input("성명", key="worker_name")
+        worker_phone = st.text_input("연락처", key="worker_phone")
         worker_count = st.number_input(
             "작업자(명)",
             min_value=0,
@@ -1490,136 +1953,87 @@ if page == "👷 현장 작업자":
     # 책임자 서명 하나만 받고, 신청인란·시행업체(책임자)란 둘 다 이 서명 + 위에서 입력한 성명으로 채움
     signature_canvas("company_rep", "책임자 서명")
 
+    with st.expander("협조자 정보 (선택)", expanded=False):
+        st.caption(
+            "담당자 협조자와 승인자 협조자는 필요한 경우에만 입력하세요. "
+            "입력한 내용은 신 안전작업허가서 맨 아래 협조자 칸에 각각 반영됩니다."
+        )
+        manager_collaborator_col, approver_collaborator_col = st.columns(2)
+        with manager_collaborator_col:
+            st.markdown("**담당자 협조자**")
+            manager_collaborator_department = st.text_input(
+                "부서",
+                key="manager_collaborator_department",
+                placeholder="부서 입력",
+            )
+            manager_collaborator_position = st.text_input(
+                "직책",
+                key="manager_collaborator_position",
+                placeholder="직책 입력",
+            )
+            manager_collaborator_name = st.text_input(
+                "성명",
+                key="manager_collaborator_name",
+                placeholder="성명 입력",
+            )
+        with approver_collaborator_col:
+            st.markdown("**승인자 협조자**")
+            approver_collaborator_department = st.text_input(
+                "부서",
+                key="approver_collaborator_department",
+                placeholder="부서 입력",
+            )
+            approver_collaborator_position = st.text_input(
+                "직책",
+                key="approver_collaborator_position",
+                placeholder="직책 입력",
+            )
+            approver_collaborator_name = st.text_input(
+                "성명",
+                key="approver_collaborator_name",
+                placeholder="성명 입력",
+            )
+
     # Section 4: 안전조치 확인 (Checkboxes)
     st.markdown('<div class="section-header">✅ 안전조치 확인</div>', unsafe_allow_html=True)
 
-    # Safety check categories (matching Excel template's actual checkbox cells)
-    # 주의: "차단기기"/"설비"는 실제 서식엔 채울 칸이 없는 고정 라벨이라 제외함
-    # 밀폐공간/정전은 카테고리 해당여부 + 위치선택이 있어 아래에서 별도 UI로 렌더링함(이 dict엔 없음)
-    safety_checks = {
-        "첨부서류": [
-            "작업계획서",
-            "기술자료(도면)",
-            "소화기목록",
-            "안전장구 목록",
-            "특수작업절차서",
-            "굴착도면"
-        ],
-        "안전조치 요구사항": [
-            "작업구역 설정(출입경고 표지)",
-            "작업구역 가연성물질 제거",
-            "밸브차단 및 차단표지부착(도면 비교)",
-            "맹판설치 및 표지부착(도면 비교)",
-            "위험물질(가연성분진 포함)방출 및 처리",
-            "보충작업허가",  # 서식에 체크박스는 없지만 목록엔 남겨둠(엑셀 미반영)
-            "용기개방 및 압력방출",
-            "용기내부 세정 및 처리",
-            "불활성가스 치환 및 환기",
-            "환기장비",
-            "가스농도 측정",
-            "조명장비",
-            "소화기",
-            "안전장구",
-            "안전교육",
-            "운전요원의 입회"
-        ],
-        "굴착": [
-            "가스,기계,소방배관",
-            "전기,계장,통신"
-        ],
-        "고소": [
-            "작업발판, 안전난간",
-            "안전사다리 사용",
-            "안전대 착용·부착",
-            "추락방지망"
-        ],
-        "중장비": [
-            "기상, 노면상태",
-            "자격증소지",
-            "현장책임자 감독",
-            "전선, 설비 간섭",
-            "신호수배치",
-            "매트 등 부속장구"
-        ]
-    }
+    safety_checks = get_safety_work_catalog()
 
-    # 체크박스가 아니라 텍스트로 채우는 항목 (실제 서식엔 빈칸으로 존재)
-    safety_text_fields = {
-        "굴착": [
-            "굴착 가스,기계,소방배관 점검자",
-            "굴착 전기,계장,통신 점검자",
-            "굴착 허가기간"
-        ],
-        "고소": [
-            "고소 허가기간"
-        ],
-        "중장비": [
-            "투입장비명",
-            "운전원 성명",
-            "중장비 허가기간"
-        ]
-    }
-
-    # 공통 항목은 항상 보이고, 작업종류별 항목은 선택한 작업에만 표시한다.
-    work_type_categories = {
-        "굴착작업": ["굴착"],
-        "고소작업": ["고소"],
-        "중장비작업": ["중장비"],
-    }
-    visible_safety_categories = ["첨부서류", "안전조치 요구사항"]
-    required_safety_checks = {("안전조치 요구사항", "안전장구"), ("안전조치 요구사항", "안전교육")}
-    for selected_work_type in work_types:
-        for category in work_type_categories.get(selected_work_type, []):
-            if category not in visible_safety_categories:
-                visible_safety_categories.append(category)
-
-    def render_safety_category(category, checks, fields, column_count=2):
-        """카테고리별 체크/입력 항목을 넓은 화면에서는 여러 열로 표시한다."""
-        st.markdown(f'<div class="category-title">{category}</div>', unsafe_allow_html=True)
-        if category == "안전조치 요구사항":
-            st.info("필수 확인: 안전장구와 안전교육을 모두 체크해야 제출할 수 있습니다.")
-
-        checkbox_columns = st.columns(min(column_count, len(checks)))
-        for index, check in enumerate(checks):
-            with checkbox_columns[index % len(checkbox_columns)]:
-                is_required = (category, check) in required_safety_checks
-                if is_required:
-                    st.checkbox(
-                        f":orange[{check}] (필수)",
-                        key=f"check_{category}_{check}",
-                        help=f"{check} 필수 항목입니다.",
-                    )
-                else:
-                    st.checkbox(check, key=f"check_{category}_{check}")
-
-        if fields:
-            text_columns = st.columns(min(2, len(fields)))
-            for index, field in enumerate(fields):
-                with text_columns[index % len(text_columns)]:
-                    if "허가기간" in field:
-                        st.markdown(f"**{field}**")
-                        st.info(f"{work_date} (작업일자와 동일)")
-                    else:
-                        st.text_input(field, key=f"text_{category}_{field}")
-
-    for category in visible_safety_categories:
-        checks = safety_checks[category]
-        # 긴 안전조치 문구는 두 열로, 나머지는 공간을 활용해 세 열로 나눈다.
-        column_count = 2 if category == "안전조치 요구사항" else 3
-        render_safety_category(
-            category,
-            checks,
-            safety_text_fields.get(category, []),
-            column_count,
+    additional_materials = st.multiselect(
+        "추가 자료",
+        ["위험성평가", "작업계획서", "기타 자료"],
+        key="additional_materials",
+    )
+    other_material = ""
+    if "기타 자료" in additional_materials:
+        other_material = st.text_input(
+            "기타 자료명", key="other_material", placeholder="예: MSDS"
         )
 
-    # 위험성평가 필요 여부 (작업절차서변화 / 작업상이 각각 유·무 선택)
-    st.markdown('<div class="checkbox-group"><strong>위험성평가 필요 여부</strong></div>', unsafe_allow_html=True)
-    risk_assessment_change = st.radio("작업절차서변화", ["선택 안 함", "유", "무"], key="risk_assessment_change", horizontal=True)
-    risk_assessment_diff = st.radio("작업상이", ["선택 안 함", "유", "무"], key="risk_assessment_diff", horizontal=True)
+    visible_safety_categories = [
+        work_type
+        for work_type in work_types
+        if work_type in safety_checks and work_type != "밀폐공간작업"
+    ]
+    if not work_types:
+        st.info("작업종류를 선택하면 해당 안전조치 항목이 표시됩니다.")
+    for category in visible_safety_categories:
+        st.markdown(
+            f'<div class="category-title">{category}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("각 항목을 확인한 후 '확인' 또는 '해당없음'을 선택하세요.")
+        result_columns = st.columns(2)
+        for item_index, item in enumerate(safety_checks[category], start=1):
+            with result_columns[(item_index - 1) % 2]:
+                st.selectbox(
+                    item,
+                    ["선택 안 함", "확인", "해당없음"],
+                    key=f"safety_result_{category}_{item_index}",
+                )
 
-    # 별도 밀폐공간작업 허가서 입력란은 "밀폐작업"을 선택한 경우에만 표시한다.
-    is_confined_space_selected = "밀폐작업" in work_types
+    # 별도 밀폐공간작업 허가서는 기존 연동 방식을 유지한다.
+    is_confined_space_selected = "밀폐공간작업" in work_types
     if is_confined_space_selected:
         st.markdown(
             '<div class="section-header">밀폐공간작업 허가서 추가 정보</div>',
@@ -1648,56 +2062,108 @@ if page == "👷 현장 작업자":
 
         st.markdown("#### 유해가스 측정결과")
         st.caption(
-            "여기에 입력한 5개 측정값은 기존 안전작업허가서의 가스농도 측정란에도 "
-            "앞에서부터 자동 반영됩니다."
+            "여기에 입력한 측정값은 밀폐공간작업 허가서와 "
+            "신 안전작업허가서에 함께 반영됩니다."
         )
-        for measurement_index in range(1, 6):
-            st.markdown(f"**측정 {measurement_index}**")
-            gas_col1, gas_col2, gas_col3, gas_col4 = st.columns([2, 1.5, 1.5, 2])
-            with gas_col1:
-                st.text_input(
-                    "측정물질명",
-                    key=f"gas_{measurement_index}_material_name",
-                    placeholder="예: O2, CO, H2S",
-                )
-            with gas_col2:
-                st.text_input(
-                    "측정농도",
-                    key=f"gas_{measurement_index}_concentration",
-                    placeholder="예: 20.9%, 0ppm",
-                )
-            with gas_col3:
-                measurement_time_key = (
-                    f"gas_{measurement_index}_measurement_time"
-                )
-                existing_measurement_time = st.session_state.get(
-                    measurement_time_key
-                )
-                if hasattr(existing_measurement_time, "strftime"):
-                    st.session_state[measurement_time_key] = (
-                        existing_measurement_time.strftime("%H:%M")
+        default_gas_names = ["CO2", "O2", "CO", "H2S", ""]
+        for measurement_index, default_name in enumerate(default_gas_names, start=1):
+            material_key = f"gas_{measurement_index}_material_name"
+            if material_key not in st.session_state:
+                st.session_state[material_key] = default_name
+
+        before_gas_tab, during_gas_tab, after_gas_tab = st.tabs(
+            ["작업 전 (필수)", "작업 중 (선택)", "작업 후 (선택)"]
+        )
+
+        with before_gas_tab:
+            st.caption(
+                "한 행 이상 물질명·측정시간·농도·측정자 성명을 모두 입력하세요."
+            )
+            for measurement_index in range(1, 6):
+                st.markdown(f"**가스 {measurement_index}**")
+                gas_columns = st.columns([1.4, 1.2, 1.2, 1.3, 1.3])
+                material_key = f"gas_{measurement_index}_material_name"
+                with gas_columns[0]:
+                    st.text_input(
+                        "측정물질명",
+                        key=material_key,
+                        placeholder="예: O2, CO, H2S",
                     )
-                elif existing_measurement_time is None:
-                    st.session_state.pop(measurement_time_key, None)
-                st.text_input(
-                    "측정시간",
-                    key=measurement_time_key,
-                    placeholder="예: 08:10 또는 0810",
-                    max_chars=5,
-                    on_change=normalize_time_widget,
-                    args=(measurement_time_key,),
+                with gas_columns[1]:
+                    measurement_time_key = (
+                        f"gas_{measurement_index}_measurement_time"
+                    )
+                    st.text_input(
+                        "측정시간",
+                        key=measurement_time_key,
+                        placeholder="예: 0810",
+                        max_chars=5,
+                        on_change=normalize_time_widget,
+                        args=(measurement_time_key,),
+                    )
+                    measurement_time_error = st.session_state.get(
+                        f"{measurement_time_key}_error"
+                    )
+                    if measurement_time_error:
+                        st.caption(f"⚠️ {measurement_time_error}")
+                with gas_columns[2]:
+                    st.text_input(
+                        "측정농도",
+                        key=f"gas_{measurement_index}_concentration",
+                        placeholder="예: 20.9%",
+                    )
+                with gas_columns[3]:
+                    st.text_input(
+                        "측정자 성명",
+                        key=f"gas_{measurement_index}_measurer_name",
+                        placeholder="성명 입력",
+                    )
+                with gas_columns[4]:
+                    st.text_input(
+                        "확인자 성명 (선택)",
+                        key=f"gas_{measurement_index}_confirmer_name",
+                        placeholder="성명 입력",
+                    )
+
+        for gas_tab, phase_key, phase_label in (
+            (during_gas_tab, "during", "작업 중"),
+            (after_gas_tab, "after", "작업 후"),
+        ):
+            with gas_tab:
+                st.caption(
+                    "선택 입력입니다. 입력하는 경우 측정시간과 농도를 모두 입력하세요."
                 )
-                measurement_time_error = st.session_state.get(
-                    f"{measurement_time_key}_error"
-                )
-                if measurement_time_error:
-                    st.caption(f"⚠️ {measurement_time_error}")
-            with gas_col4:
-                st.text_input(
-                    "측정자 성명",
-                    key=f"gas_{measurement_index}_measurer_name",
-                    placeholder="성명 입력",
-                )
+                for measurement_index in range(1, 6):
+                    material_name = st.session_state.get(
+                        f"gas_{measurement_index}_material_name", ""
+                    )
+                    st.markdown(
+                        f"**{material_name or f'가스 {measurement_index}'}**"
+                    )
+                    time_col, concentration_col = st.columns(2)
+                    measurement_time_key = (
+                        f"gas_{measurement_index}_{phase_key}_measurement_time"
+                    )
+                    with time_col:
+                        st.text_input(
+                            f"{phase_label} 측정시간",
+                            key=measurement_time_key,
+                            placeholder="예: 1210",
+                            max_chars=5,
+                            on_change=normalize_time_widget,
+                            args=(measurement_time_key,),
+                        )
+                        measurement_time_error = st.session_state.get(
+                            f"{measurement_time_key}_error"
+                        )
+                        if measurement_time_error:
+                            st.caption(f"⚠️ {measurement_time_error}")
+                    with concentration_col:
+                        st.text_input(
+                            f"{phase_label} 측정농도",
+                            key=f"gas_{measurement_index}_{phase_key}_concentration",
+                            placeholder="예: 20.9%",
+                        )
 
         st.text_area(
             "특별조치 필요사항",
@@ -1785,22 +2251,7 @@ if page == "👷 현장 작업자":
                     key=f"confined_worker_{person_index}_name",
                 )
 
-    # 정전 항목은 전기작업 선택 시에만 표시한다.
-    is_power_outage_work = "전기작업" in work_types
-    power_outage_location = "선택 안 함"
-    if is_power_outage_work:
-        st.markdown('<div class="checkbox-group"><strong>정전</strong></div>', unsafe_allow_html=True)
-        power_outage_applies = st.checkbox("정전 작업 해당", key="check_정전_해당")
-        power_outage_location = st.radio(
-            "차단 위치", ["선택 안 함", "제어실", "현장"], key="power_outage_location", horizontal=True
-        )
-        st.checkbox("스위치/차단기 내림", key="check_정전_스위치/차단기 내림")
-        st.checkbox("잠금장치 시건, 표지부착", key="check_정전_잠금장치 시건, 표지부착")
-        st.markdown("**정전 허가기간**")
-        st.info(f"{work_date} (작업일자와 동일)")
-        st.info("전원복구 참고: 모든 작업이 완료 된 후 운전부서의 입회자의 요청에 의해서만 전원을 복구하여야 한다.")
-        st.text_input("전원복구 요청자", key="text_정전_전원복구 요청자")
-        st.text_input("전원복구 시간", key="text_정전_전원복구 시간")
+    power_outage_location = None
 
     # Additional safety notes
     special_notes = st.text_input("기타 특별사항", key="special_notes")
@@ -1829,11 +2280,16 @@ if page == "👷 현장 작업자":
         if st.button("📤 제출하기", use_container_width=True, type="primary"):
             normalized_start, start_error = normalize_clock_time(permit_start_time)
             normalized_end, end_error = normalize_clock_time(permit_end_time)
-            missing_required_checks = [
-                check
-                for category, check in required_safety_checks
-                if not st.session_state.get(f"check_{category}_{check}", False)
-            ]
+            selected_safety_checks = {}
+            for category in visible_safety_categories:
+                selected_safety_checks[category] = {
+                    item: st.session_state.get(
+                        f"safety_result_{category}_{item_index}", "선택 안 함"
+                    )
+                    for item_index, item in enumerate(
+                        safety_checks[category], start=1
+                    )
+                }
             confined_data = None
             if is_confined_space_selected:
                 confined_data = build_confined_space_payload(
@@ -1856,19 +2312,25 @@ if page == "👷 현장 작업자":
                         "worker_name": worker_name,
                     },
                 )
+                confined_checks, shared_gas_measurements = (
+                    confined_payload_to_safety_fields(confined_data)
+                )
+                selected_safety_checks["밀폐공간작업"] = confined_checks
 
             validation_errors = []
             if selected_manager is None:
                 validation_errors.append("담당 관리자를 선택해 주세요.")
+            if not work_types:
+                validation_errors.append("작업종류를 하나 이상 선택해 주세요.")
             if start_error:
                 validation_errors.append(f"작업 시작 시간: {start_error}")
             if end_error:
                 validation_errors.append(f"작업 종료 시간: {end_error}")
-            if missing_required_checks:
-                validation_errors.append(
-                    "안전조치 요구사항의 필수 항목을 체크해 주세요: "
-                    + ", ".join(sorted(missing_required_checks))
+            validation_errors.extend(
+                validate_selected_safety_checks(
+                    work_types, selected_safety_checks
                 )
+            )
             if confined_data is not None and not start_error and not end_error:
                 validation_errors.extend(
                     validate_confined_space_payload(
@@ -1906,17 +2368,26 @@ if page == "👷 현장 작업자":
                 'company_name': company_name,
                 'worker_position': worker_position,
                 'worker_name': worker_name,
+                'worker_phone': worker_phone,
                 'worker_count': int(worker_count) if worker_count else None,
+                'manager_collaborator_department': manager_collaborator_department,
+                'manager_collaborator_position': manager_collaborator_position,
+                'manager_collaborator_name': manager_collaborator_name,
+                'approver_collaborator_department': approver_collaborator_department,
+                'approver_collaborator_position': approver_collaborator_position,
+                'approver_collaborator_name': approver_collaborator_name,
                 'work_description': work_description,
                 'special_notes': special_notes,
-                'power_outage_location': None if power_outage_location == "선택 안 함" else power_outage_location,
-                'risk_assessment_change': None if risk_assessment_change == "선택 안 함" else risk_assessment_change,
-                'risk_assessment_diff': None if risk_assessment_diff == "선택 안 함" else risk_assessment_diff,
+                'additional_materials': additional_materials,
+                'other_material': other_material,
+                'power_outage_location': power_outage_location,
+                'risk_assessment_change': None,
+                'risk_assessment_diff': None,
                 'extend_requested': extend_requested == "연장 신청",
                 'extend_date': str(extend_date) if extend_date else None,
                 'extend_start': str(extend_start) if extend_start else None,
                 'extend_end': str(extend_end) if extend_end else None,
-                'safety_checks': {},
+                'safety_checks': selected_safety_checks,
                 'safety_text_fields': {},
                 'gas_measurements': [],
                 'signatures': st.session_state.signatures
@@ -1925,47 +2396,11 @@ if page == "👷 현장 작업자":
                 form_data, selected_manager, auto_email_enabled
             )
             
-            # Collect safety checks
-            for category in visible_safety_categories:
-                checks = safety_checks[category]
-                form_data['safety_checks'][category] = {}
-                for check in checks:
-                    form_data['safety_checks'][category][check] = st.session_state.get(f"check_{category}_{check}", False)
-            
-            # Collect safety text fields (투입장비명, 운전원 성명, 각종 허가기간/점검자 등)
-            for category in visible_safety_categories:
-                fields = safety_text_fields.get(category, [])
-                for field in fields:
-                    if "허가기간" in field:
-                        form_data['safety_text_fields'][field] = str(work_date)
-                    else:
-                        value = st.session_state.get(f"text_{category}_{field}", "")
-                        if value:
-                            form_data['safety_text_fields'][field] = str(value)
-            
-            # 밀폐작업이면 별도 허가서 데이터를 저장하고, 중복되는 안전작업허가서
-            # 체크/가스측정 값은 같은 입력에서 자동으로 만든다.
+            # 밀폐공간작업은 별도 허가서와 신 안전작업허가서에
+            # 공통 입력값을 함께 사용한다.
             if is_confined_space_selected:
                 form_data["confined_space"] = confined_data
-                confined_checks, shared_gas_measurements = (
-                    confined_payload_to_safety_fields(confined_data)
-                )
-                form_data['safety_checks']['밀폐공간'] = confined_checks
-                form_data['safety_text_fields']['밀폐공간 허가기간'] = str(work_date)
                 form_data['gas_measurements'] = shared_gas_measurements
-            
-            # 정전 (전기작업일 때만 저장)
-            if is_power_outage_work:
-                form_data['safety_checks']['정전'] = {
-                    '해당': st.session_state.get("check_정전_해당", False),
-                    '스위치/차단기 내림': st.session_state.get("check_정전_스위치/차단기 내림", False),
-                    '잠금장치 시건, 표지부착': st.session_state.get("check_정전_잠금장치 시건, 표지부착", False),
-                }
-                form_data['safety_text_fields']['정전 허가기간'] = str(work_date)
-                for field in ["전원복구 요청자", "전원복구 시간"]:
-                    value = st.session_state.get(f"text_정전_{field}", "")
-                    if value:
-                        form_data['safety_text_fields'][field] = str(value)
             
             # Save form
             saved_document_id = save_form(form_data)
@@ -2036,25 +2471,23 @@ if page == "👷 현장 작업자":
 
     st.table(pd.DataFrame(summary_data))
 
-    # Display checked safety items
-    st.markdown("### ✅ 확인된 안전조치 항목")
+    # Display selected safety results
+    st.markdown("### ✅ 안전조치 선택 결과")
     checked_items = []
     for category in visible_safety_categories:
-        checks = safety_checks[category]
-        for check in checks:
-            if st.session_state.get(f"check_{category}_{check}", False):
-                checked_items.append(f"{category}: {check}")
+        for item_index, item in enumerate(safety_checks[category], start=1):
+            result = st.session_state.get(
+                f"safety_result_{category}_{item_index}", "선택 안 함"
+            )
+            if result != "선택 안 함":
+                checked_items.append(f"{category}: {item} ({result})")
     if is_confined_space_selected:
         for item_index, item in enumerate(CONFINED_SPACE_SAFETY_ITEMS, start=1):
             result = st.session_state.get(
                 f"confined_safety_{item_index}", "선택 안 함"
             )
             if result != "선택 안 함":
-                checked_items.append(f"밀폐공간: {item} ({result})")
-    if is_power_outage_work:
-        for check in ["해당", "스위치/차단기 내림", "잠금장치 시건, 표지부착"]:
-            if st.session_state.get(f"check_정전_{check}", False):
-                checked_items.append(f"정전: {check}")
+                checked_items.append(f"밀폐공간작업: {item} ({result})")
 
     if checked_items:
         for item in checked_items:
@@ -2062,30 +2495,15 @@ if page == "👷 현장 작업자":
     else:
         st.info("아직 확인된 안전조치 항목이 없습니다.")
 
-    # Display filled text fields (허가기간, 점검자, 전원복구, 투입장비 등)
-    filled_text_fields = []
-    for category in visible_safety_categories:
-        fields = safety_text_fields.get(category, [])
-        for field in fields:
-            if "허가기간" in field:
-                filled_text_fields.append(f"{field}: {work_date}")
-            else:
-                value = st.session_state.get(f"text_{category}_{field}", "")
-                if value:
-                    filled_text_fields.append(f"{field}: {value}")
+    filled_text_fields = [
+        "추가 자료: " + ", ".join(additional_materials)
+    ] if additional_materials else []
+    if other_material:
+        filled_text_fields.append(f"기타 자료명: {other_material}")
     if is_confined_space_selected:
-        filled_text_fields.append(f"밀폐공간 허가기간: {work_date}")
         internal_contact = st.session_state.get("confined_internal_contact", "")
         if internal_contact:
             filled_text_fields.append(f"밀폐공간 내부 연락방법: {internal_contact}")
-    if is_power_outage_work:
-        filled_text_fields.append(f"정전 허가기간: {work_date}")
-        for field in ["전원복구 요청자", "전원복구 시간"]:
-            value = st.session_state.get(f"text_정전_{field}", "")
-            if value:
-                filled_text_fields.append(f"{field}: {value}")
-    if is_power_outage_work and power_outage_location != "선택 안 함":
-        filled_text_fields.append(f"정전 차단 위치: {power_outage_location}")
 
     if filled_text_fields:
         st.markdown("### 📝 입력된 텍스트 항목")
@@ -2097,17 +2515,37 @@ if page == "👷 현장 작업자":
         for measurement_index in range(1, 6):
             measurement_time = st.session_state.get(f"gas_{measurement_index}_measurement_time")
             measurement = {
-                "구분": f"측정 {measurement_index}",
                 "물질명": st.session_state.get(f"gas_{measurement_index}_material_name", ""),
-                "측정농도": st.session_state.get(f"gas_{measurement_index}_concentration", ""),
-                "측정시간": format_time_value(measurement_time),
-                "측정자 성명": st.session_state.get(
+                "작업 전 시간": format_time_value(measurement_time),
+                "작업 전 농도": st.session_state.get(
+                    f"gas_{measurement_index}_concentration", ""
+                ),
+                "작업 중 시간": format_time_value(
+                    st.session_state.get(
+                        f"gas_{measurement_index}_during_measurement_time"
+                    )
+                ),
+                "작업 중 농도": st.session_state.get(
+                    f"gas_{measurement_index}_during_concentration", ""
+                ),
+                "작업 후 시간": format_time_value(
+                    st.session_state.get(
+                        f"gas_{measurement_index}_after_measurement_time"
+                    )
+                ),
+                "작업 후 농도": st.session_state.get(
+                    f"gas_{measurement_index}_after_concentration", ""
+                ),
+                "측정자": st.session_state.get(
                     f"gas_{measurement_index}_measurer_name", ""
+                ),
+                "확인자": st.session_state.get(
+                    f"gas_{measurement_index}_confirmer_name", ""
                 ),
             }
             if any(
                 measurement[field]
-                for field in ["물질명", "측정농도", "측정시간", "측정자 성명"]
+                for field in measurement
             ):
                 gas_measurement_summary.append(measurement)
 
@@ -2465,11 +2903,29 @@ else:
                     st.markdown("**가스농도 측정:**")
                     st.table(pd.DataFrame([
                         {
-                            "구분": f"측정 {index}",
                             "물질명": measurement.get('material_name', ''),
-                            "결과": measurement.get('result', ''),
-                            "측정시간": measurement.get('measurement_time', ''),
-                            "측정자/확인자": measurement.get('measurer_confirmer', ''),
+                            "작업 전 시간": measurement.get('measurement_time', ''),
+                            "작업 전 농도": (
+                                measurement.get('result', '')
+                                or measurement.get('concentration', '')
+                            ),
+                            "작업 중 시간": measurement.get(
+                                'during_measurement_time', ''
+                            ),
+                            "작업 중 농도": measurement.get(
+                                'during_concentration', ''
+                            ),
+                            "작업 후 시간": measurement.get(
+                                'after_measurement_time', ''
+                            ),
+                            "작업 후 농도": measurement.get(
+                                'after_concentration', ''
+                            ),
+                            "측정자": (
+                                measurement.get('measurer_name', '')
+                                or measurement.get('measurer_confirmer', '')
+                            ),
+                            "확인자": measurement.get('confirmer_name', ''),
                         }
                         for index, measurement in gas_measurements
                     ]))
@@ -2545,3 +3001,43 @@ else:
                 with action_columns[-1]:
                     if st.button(f"🖨️ 인쇄", key=f"print_{form_key}", use_container_width=True):
                         st.info("📄 Excel 다운로드 후 인쇄하세요.")
+                
+        # Bulk actions
+        st.markdown("---")
+        st.markdown("### Firebase 저장 기록 관리")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("Firebase 저장 기록 전체 삭제", use_container_width=True):
+                st.session_state.confirm_delete_all_forms = True
+
+            if st.session_state.get('confirm_delete_all_forms'):
+                st.warning("정말 Firebase에 저장된 모든 허가서 기록을 삭제할까요? 이 작업은 되돌릴 수 없습니다.")
+                confirm_col, cancel_col = st.columns(2)
+                with confirm_col:
+                    if st.button("삭제 확정", key="confirm_delete_all_forms_button", use_container_width=True, type="primary"):
+                        with st.spinner("Firebase 저장 기록 삭제 중..."):
+                            deleted_count = delete_all_forms()
+                        if deleted_count is not None:
+                            st.session_state.confirm_delete_all_forms = False
+                            st.success(f"{deleted_count}건이 삭제되었습니다.")
+                            st.rerun()
+                with cancel_col:
+                    if st.button("취소", key="cancel_delete_all_forms_button", use_container_width=True):
+                        st.session_state.confirm_delete_all_forms = False
+                        st.rerun()
+        
+        with col2:
+            if st.button("📊 통계 보기", use_container_width=True):
+                st.markdown("### 📊 제출 통계")
+                work_types = [f['work_type'] for f in forms]
+                type_counts = pd.Series(work_types).value_counts()
+                st.bar_chart(type_counts)
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666; font-size: 0.8rem;'>
+    안전작업허가서 시스템 | 모바일 친화적 설계
+</div>
+""", unsafe_allow_html=True)
